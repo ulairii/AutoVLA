@@ -17,21 +17,14 @@ PIP_CACHE_DIR="${PIP_CACHE_DIR:-${SCRATCH_ROOT}/.pip_cache}"
 
 mkdir -p "${ENV_ROOT}" "${HF_HOME}" "${PIP_CACHE_DIR}"
 
-if command -v module >/dev/null 2>&1; then
-  module purge || true
-  module load anaconda3 || true
-fi
-
-if [[ -f /etc/profile ]]; then
-  source /etc/profile || true
-fi
-
-if ! command -v conda >/dev/null 2>&1; then
-  echo "conda command not found in the current shell."
+CONDA_BIN="${CONDA_BIN:-/home/runw/miniconda/bin/conda}"
+if [[ ! -x "${CONDA_BIN}" ]]; then
+  echo "conda not found at ${CONDA_BIN}"
   exit 1
 fi
 
-eval "$(conda shell.bash hook)"
+"${CONDA_BIN}" shell.bash hook >/dev/null 2>&1
+eval "$("${CONDA_BIN}" shell.bash hook)"
 
 export HF_HOME
 export PIP_CACHE_DIR

@@ -45,18 +45,14 @@ export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-source /etc/profile || true
-if command -v module >/dev/null 2>&1; then
-  module purge || true
-  module load anaconda3 || true
-fi
-
-if ! command -v conda >/dev/null 2>&1; then
-  echo "conda command not found in the current shell"
+CONDA_BIN="${CONDA_BIN:-/home/runw/miniconda/bin/conda}"
+if [[ ! -x "${CONDA_BIN}" ]]; then
+  echo "conda not found at ${CONDA_BIN}"
   exit 1
 fi
 
-eval "$(conda shell.bash hook)"
+"${CONDA_BIN}" shell.bash hook >/dev/null 2>&1
+eval "$("${CONDA_BIN}" shell.bash hook)"
 conda activate "${ENV_PREFIX}"
 
 CONFIG="${CONFIG:-${PROJECT_ROOT}/config/eval/qwen2.5-vl-3B-nusc-sft-autovla-attack.yaml}"
