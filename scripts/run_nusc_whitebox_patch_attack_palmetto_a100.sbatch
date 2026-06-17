@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH -J autovla_wb_patch
-#SBATCH -p a100
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96G
@@ -21,7 +20,13 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
 fi
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Project/AutoVLA}"
-SCRATCH_ROOT="${SCRATCH_ROOT:-/scratch/$USER}"
+if [[ -z "${SCRATCH_ROOT:-}" ]]; then
+  if [[ "${USER:-}" == "coder" ]]; then
+    SCRATCH_ROOT="/scratch/runw"
+  else
+    SCRATCH_ROOT="/scratch/$USER"
+  fi
+fi
 AUTOVLA_ROOT="${AUTOVLA_ROOT:-${SCRATCH_ROOT}/autovla_attack}"
 ENV_PREFIX="${ENV_PREFIX:-${SCRATCH_ROOT}/envs/autovla_codeclean}"
 HF_HOME="${HF_HOME:-${SCRATCH_ROOT}/.hf_cache}"
@@ -46,20 +51,17 @@ if command -v module >/dev/null 2>&1; then
   module load anaconda3 || true
 fi
 
-if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
-  source "$HOME/miniconda3/etc/profile.d/conda.sh"
-elif [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
-  source "$HOME/anaconda3/etc/profile.d/conda.sh"
-else
-  echo "Could not locate conda.sh"
+if ! command -v conda >/dev/null 2>&1; then
+  echo "conda command not found in the current shell"
   exit 1
 fi
 
+eval "$(conda shell.bash hook)"
 conda activate "${ENV_PREFIX}"
 
 CONFIG="${CONFIG:-${PROJECT_ROOT}/config/eval/qwen2.5-vl-3B-nusc-sft-autovla-attack.yaml}"
 SCENE_DIR="${SCENE_DIR:-${AUTOVLA_ROOT}/nuscenes_val}"
-SENSOR_DATA_PATH="${SENSOR_DATA_PATH:-/path/to/nuscenes}"
+SENSOR_DATA_PATH="${SENSOR_DATA_PATH:-/mnt/indigo/tigersec/runw/datasets/nuscenes/data_full/nuscenes}"
 CHECKPOINT="${CHECKPOINT:-${AUTOVLA_ROOT}/models/autovla_ckpt/AutoVLA_PDMS_89.ckpt}"
 
 for required in "${CONFIG}" "${SCENE_DIR}" "${CHECKPOINT}"; do

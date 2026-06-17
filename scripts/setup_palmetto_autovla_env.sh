@@ -2,7 +2,13 @@
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Project/AutoVLA}"
-SCRATCH_ROOT="${SCRATCH_ROOT:-/scratch/$USER}"
+if [[ -z "${SCRATCH_ROOT:-}" ]]; then
+  if [[ "${USER:-}" == "coder" ]]; then
+    SCRATCH_ROOT="/scratch/runw"
+  else
+    SCRATCH_ROOT="/scratch/$USER"
+  fi
+fi
 ENV_ROOT="${ENV_ROOT:-${SCRATCH_ROOT}/envs}"
 ENV_NAME="${ENV_NAME:-autovla_codeclean}"
 ENV_PREFIX="${ENV_ROOT}/${ENV_NAME}"
@@ -20,14 +26,12 @@ if [[ -f /etc/profile ]]; then
   source /etc/profile || true
 fi
 
-if [[ -f "$HOME/miniconda3/etc/profile.d/conda.sh" ]]; then
-  source "$HOME/miniconda3/etc/profile.d/conda.sh"
-elif [[ -f "$HOME/anaconda3/etc/profile.d/conda.sh" ]]; then
-  source "$HOME/anaconda3/etc/profile.d/conda.sh"
-else
-  echo "Could not find conda.sh. Load anaconda/miniforge first."
+if ! command -v conda >/dev/null 2>&1; then
+  echo "conda command not found in the current shell."
   exit 1
 fi
+
+eval "$(conda shell.bash hook)"
 
 export HF_HOME
 export PIP_CACHE_DIR
