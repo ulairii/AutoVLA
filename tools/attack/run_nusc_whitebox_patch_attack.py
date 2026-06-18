@@ -25,7 +25,6 @@ import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image
-from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor
 
 from dataset_utils.sft_dataset import SFTDataset
@@ -254,16 +253,20 @@ def _build_surrogate_messages(
 
 
 def _prepare_surrogate_batch(processor, messages: Sequence[Dict], device: str) -> Tuple[Dict[str, torch.Tensor], str]:
-    image_inputs, video_inputs = process_vision_info(messages)
     text = processor.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
         add_vision_id=True,
     )
+    video_inputs = []
+    for message in messages:
+        for content in message.get("content", []):
+            if isinstance(content, dict) and content.get("type") == "video":
+                video_inputs.append(content["video"])
     batch = processor(
         text=[text],
-        images=image_inputs,
+        images=None,
         videos=video_inputs,
         padding=True,
         return_tensors="pt",
