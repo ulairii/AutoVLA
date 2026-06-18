@@ -41,7 +41,6 @@ class WhiteBoxPatchConfig:
     lr: float = 8.0 / 255.0
     max_delta: float = 32.0 / 255.0
     action_loss_weight: float = 1.0
-    downscale_short_edge: int = 224
     cameras: Tuple[str, ...] = ("front_camera_paths",)
     frames: Tuple[int, ...] = (2, 3)
 
@@ -65,7 +64,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--lr", type=float, default=8.0 / 255.0)
     parser.add_argument("--max_delta", type=float, default=32.0 / 255.0)
-    parser.add_argument("--downscale_short_edge", type=int, default=224)
     parser.add_argument("--cameras", type=str, default="front_camera_paths")
     parser.add_argument("--frames", type=str, default="2,3")
     return parser.parse_args()
@@ -117,19 +115,6 @@ def _scene_videos_from_paths(scene: Mapping, sensor_root: str, device: str) -> T
             frame_map[(camera_key, frame_idx)] = tensor
         videos.append(frames)
     return videos, frame_map
-
-
-def _downscale_frame(frame: torch.Tensor, short_edge: int) -> torch.Tensor:
-    _, h, w = frame.shape
-    if min(h, w) <= short_edge:
-        return frame
-    if h < w:
-        new_h = short_edge
-        new_w = int(round(w * short_edge / h))
-    else:
-        new_w = short_edge
-        new_h = int(round(h * short_edge / w))
-    return F.interpolate(frame.unsqueeze(0), size=(new_h, new_w), mode="bilinear", align_corners=False).squeeze(0)
 
 
 def _apply_patch_to_videos(
@@ -233,10 +218,6 @@ def optimize_patch(
     for _ in range(config.steps):
         optimizer.zero_grad()
         patched_videos, _ = _apply_patch_to_videos(clean_videos, config, patch_param)
-        patched_videos = [
-            [_downscale_frame(frame, config.downscale_short_edge) for frame in video]
-            for video in patched_videos
-        ]
         batch = _prepare_model_batch(
             processor=processor,
             prompt_text=prompt_text,
@@ -306,7 +287,6 @@ def main() -> None:
         steps=args.steps,
         lr=args.lr,
         max_delta=args.max_delta,
-        downscale_short_edge=args.downscale_short_edge,
         cameras=tuple(part.strip() for part in args.cameras.split(",") if part.strip()),
         frames=tuple(int(part.strip()) for part in args.frames.split(",") if part.strip()),
     )

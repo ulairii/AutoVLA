@@ -172,7 +172,6 @@ python tools/attack/run_nusc_whitebox_patch_attack.py \
   --steps 10 \
   --lr 0.01 \
   --max_delta 0.08 \
-  --downscale_short_edge 160 \
   --cameras front_camera_paths \
   --frames 3
 
