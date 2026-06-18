@@ -1,11 +1,14 @@
 #!/bin/bash
 #SBATCH -J autovla_wb_patch
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --partition=mri2020
 #SBATCH --gres=gpu:a100:1
-#SBATCH --cpus-per-task=12
+#SBATCH --cpus-per-task=6
 #SBATCH --mem=96G
-#SBATCH -t 12:00:00
-#SBATCH -o logs/%x-%j.out
-#SBATCH -e logs/%x-%j.err
+#SBATCH -t 24:00:00
+#SBATCH --output=/project/mpese/tigersec/runw/workdirs/autovla_attack/palmetto_log/autovla_wb_patch_%j.out
+#SBATCH --error=/project/mpese/tigersec/runw/workdirs/autovla_attack/palmetto_log/autovla_wb_patch_%j.err
 
 set -euo pipefail
 
@@ -19,22 +22,16 @@ if ! command -v nvidia-smi >/dev/null 2>&1; then
   exit 1
 fi
 
-PROJECT_ROOT="${PROJECT_ROOT:-$HOME/Project/AutoVLA}"
-if [[ -z "${SCRATCH_ROOT:-}" ]]; then
-  if [[ "${USER:-}" == "coder" ]]; then
-    SCRATCH_ROOT="/scratch/runw"
-  else
-    SCRATCH_ROOT="/scratch/$USER"
-  fi
-fi
-AUTOVLA_ROOT="${AUTOVLA_ROOT:-${SCRATCH_ROOT}/autovla_attack}"
+PROJECT_ROOT="${PROJECT_ROOT:-/home/runw/project/AutoVLA}"
+SCRATCH_ROOT="${SCRATCH_ROOT:-/scratch/runw}"
+AUTOVLA_ROOT="${AUTOVLA_ROOT:-/project/mpese/tigersec/runw/workdirs/autovla_attack}"
 ENV_PREFIX="${ENV_PREFIX:-${SCRATCH_ROOT}/envs/autovla_codeclean}"
-HF_HOME="${HF_HOME:-${SCRATCH_ROOT}/.hf_cache}"
+HF_HOME="${HF_HOME:-${SCRATCH_ROOT}/hf_cache}"
 PIP_CACHE_DIR="${PIP_CACHE_DIR:-${SCRATCH_ROOT}/.pip_cache}"
 TMPDIR="${TMPDIR:-${SCRATCH_ROOT}/tmp/${SLURM_JOB_ID}}"
+PALMETTO_LOG_DIR="${PALMETTO_LOG_DIR:-${AUTOVLA_ROOT}/palmetto_log}"
 
-mkdir -p "${AUTOVLA_ROOT}/logs" "${HF_HOME}" "${PIP_CACHE_DIR}" "${TMPDIR}"
-mkdir -p "${PROJECT_ROOT}/logs"
+mkdir -p "${PALMETTO_LOG_DIR}" "${HF_HOME}" "${PIP_CACHE_DIR}" "${TMPDIR}"
 
 export HF_HOME
 export PIP_CACHE_DIR
@@ -44,6 +41,8 @@ export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-6}"
+export PYTHONPATH="${PROJECT_ROOT}"
 
 CONDA_BIN="${CONDA_BIN:-/home/runw/miniconda/bin/conda}"
 if [[ ! -x "${CONDA_BIN}" ]]; then
@@ -51,13 +50,21 @@ if [[ ! -x "${CONDA_BIN}" ]]; then
   exit 1
 fi
 
-"${CONDA_BIN}" shell.bash hook >/dev/null 2>&1
-eval "$("${CONDA_BIN}" shell.bash hook)"
+set +u
+if [[ -f /home/runw/miniconda/etc/profile.d/conda.sh ]]; then
+  source /home/runw/miniconda/etc/profile.d/conda.sh
+elif [[ -f /home/runw/miniconda3/etc/profile.d/conda.sh ]]; then
+  source /home/runw/miniconda3/etc/profile.d/conda.sh
+else
+  echo "Could not locate conda.sh"
+  exit 1
+fi
 conda activate "${ENV_PREFIX}"
+set -u
 
 CONFIG="${CONFIG:-${PROJECT_ROOT}/config/eval/qwen2.5-vl-3B-nusc-sft-autovla-attack.yaml}"
 SCENE_DIR="${SCENE_DIR:-${AUTOVLA_ROOT}/nuscenes_val}"
-SENSOR_DATA_PATH="${SENSOR_DATA_PATH:-/mnt/indigo/tigersec/runw/datasets/nuscenes/data_full/nuscenes}"
+SENSOR_DATA_PATH="${SENSOR_DATA_PATH:-/project/mpese/tigersec/runw/datasets/nuscenes/data_full/nuscenes}"
 CHECKPOINT="${CHECKPOINT:-${AUTOVLA_ROOT}/models/autovla_ckpt/AutoVLA_PDMS_89.ckpt}"
 
 for required in "${CONFIG}" "${SCENE_DIR}" "${CHECKPOINT}"; do
@@ -70,6 +77,7 @@ done
 echo "=== AutoVLA white-box patch attack ==="
 echo "job_id=${SLURM_JOB_ID}"
 echo "host=$(hostname)"
+echo "partition=${SLURM_JOB_PARTITION:-unknown}"
 echo "env_prefix=${ENV_PREFIX}"
 echo "work_dir=${AUTOVLA_ROOT}"
 echo "scene_dir=${SCENE_DIR}"
@@ -81,7 +89,7 @@ monitor_loop() {
   while true; do
     echo "--- monitor $(date '+%F %T') ---"
     nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader
-    ps -u "$USER" -o pid,pcpu,pmem,etime,cmd --sort=-pmem | head -n 8
+    ps -u "$(id -un)" -o pid,pcpu,pmem,etime,cmd --sort=-pmem | head -n 8
     sleep "${MONITOR_INTERVAL}"
   done
 }
