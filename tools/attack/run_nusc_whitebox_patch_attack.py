@@ -25,9 +25,10 @@ import torch
 import torch.nn.functional as F
 import yaml
 from PIL import Image
+from qwen_vl_utils import process_vision_info
 from transformers import AutoProcessor
 
-from dataset_utils.sft_dataset import DataCollator, SFTDataset
+from dataset_utils.sft_dataset import SFTDataset
 from tools.attack.patch_attack import CAMERA_KEYS, load_scene, save_scene
 from tools.attack.run_nusc_patch_attack import build_features, build_model, predict_scene
 from tools.attack.visualization import visualize_attack_sample
@@ -43,6 +44,13 @@ class WhiteBoxPatchConfig:
     action_loss_weight: float = 1.0
     cameras: Tuple[str, ...] = ("front_camera_paths",)
     frames: Tuple[int, ...] = (2, 3)
+
+
+CAMERA_LABELS = {
+    "front_camera_paths": "front",
+    "front_left_camera_paths": "front-left",
+    "front_right_camera_paths": "front-right",
+}
 
 
 def load_config(config_path: Path) -> Dict:
@@ -117,6 +125,10 @@ def _scene_videos_from_paths(scene: Mapping, sensor_root: str, device: str) -> T
     return videos, frame_map
 
 
+def _camera_index(camera_key: str) -> int:
+    return CAMERA_KEYS.index(camera_key)
+
+
 def _apply_patch_to_videos(
     videos: Sequence[Sequence[torch.Tensor]],
     config: WhiteBoxPatchConfig,
@@ -148,43 +160,169 @@ def _apply_patch_to_videos(
     return patched_videos, patched_frames
 
 
-def _prepare_model_batch(
-    processor,
-    prompt_text: str,
+def _selected_videos(
     videos: Sequence[Sequence[torch.Tensor]],
-    labels: torch.Tensor,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    gt_trajectory: torch.Tensor,
-    gt_action: torch.Tensor,
-    has_cot: torch.Tensor,
-    device: str,
-) -> Dict[str, torch.Tensor]:
-    processed = processor(
-        text=[prompt_text],
-        videos=list(videos),
-        images=None,
+    cameras: Sequence[str],
+    frames: Sequence[int],
+) -> List[List[torch.Tensor]]:
+    selected: List[List[torch.Tensor]] = []
+    frame_set = set(frames)
+    for camera_key in cameras:
+        cam_videos = videos[_camera_index(camera_key)]
+        picked = [frame for idx, frame in enumerate(cam_videos) if idx in frame_set]
+        if not picked:
+            raise ValueError(f"No frames selected for camera {camera_key} with frames={frames}")
+        selected.append(picked)
+    return selected
+
+
+def _format_speed(value) -> float:
+    if isinstance(value, (list, tuple, np.ndarray)):
+        return float(np.sqrt(np.square(value[0]) + np.square(value[1])))
+    return float(value)
+
+
+def _build_surrogate_messages(
+    input_features: Mapping,
+    videos: Sequence[Sequence[torch.Tensor]],
+    cameras: Sequence[str],
+    use_cot: bool,
+) -> List[Dict]:
+    velocity = _format_speed(input_features["vehicle_velocity"])
+    acceleration = _format_speed(input_features["vehicle_acceleration"])
+    instruction = str(input_features["driving_command"]).lower()
+
+    user_content: List[Dict] = [
+        {
+            "type": "text",
+            "text": (
+                "The autonomous vehicle is equipped with forward-looking cameras. "
+                "The following selected camera clips are the visual observations available for planning."
+            ),
+        }
+    ]
+    for order, (camera_key, camera_frames) in enumerate(zip(cameras, videos), start=1):
+        label = CAMERA_LABELS.get(camera_key, camera_key)
+        plural = "s" if len(camera_frames) > 1 else ""
+        user_content.append(
+            {
+                "type": "text",
+                "text": (
+                    f"The {order}th video presents the {label} view of the vehicle, "
+                    f"comprising {len(camera_frames)} sequential frame{plural} sampled at 2 Hz."
+                ),
+            }
+        )
+        user_content.append(
+            {
+                "type": "video",
+                "min_pixels": 28 * 28 * 128,
+                "max_pixels": 28 * 28 * 128,
+                "video": list(camera_frames),
+            }
+        )
+    user_content.append(
+        {
+            "type": "text",
+            "text": (
+                f"The current velocity of the vehicle is {velocity:.3f} m/s, and the current acceleration is {acceleration:.3f} m/s². "
+                f"The driving instruction is: {instruction}. Based on this information, plan the action trajectory for the autonomous vehicle over the next five seconds."
+            ),
+        }
+    )
+
+    if use_cot:
+        system_text = (
+            "You are an Advanced Driver Assistance and Full Self-Driving System. "
+            "You will receive visual observations from the ego vehicle's cameras and dynamic information about the vehicle's current state. "
+            "Your task is to predict the optimal driving action for the next five seconds.\n\n"
+            "First, carefully analyze the surrounding environment by considering traffic lights, the movements of other vehicles and pedestrians, lane markings, and any other relevant factors.\n\n"
+            "If necessary, use step-by-step reasoning (Chain-of-Thought) to arrive at the best driving action. Otherwise, you may directly predict the final driving action.\n\n"
+            "Present the final action clearly after your reasoning steps."
+        )
+    else:
+        system_text = (
+            "You are an Advanced Driver Assistance and Full Self-Driving System. "
+            "You will be provided with video observations from the ego vehicle's surrounding cameras, along with the vehicle's current dynamic states. "
+            "Your task is to predict the most appropriate driving action for the next five seconds."
+        )
+
+    return [
+        {"role": "system", "content": [{"type": "text", "text": system_text}]},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _prepare_surrogate_batch(processor, messages: Sequence[Dict], device: str) -> Tuple[Dict[str, torch.Tensor], str]:
+    image_inputs, video_inputs = process_vision_info(messages)
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        add_vision_id=True,
+    )
+    batch = processor(
+        text=[text],
+        images=image_inputs,
+        videos=video_inputs,
         padding=True,
         return_tensors="pt",
     )
-    batch = {
-        "input_ids": processed["input_ids"].to(device),
-        "attention_mask": processed["attention_mask"].to(device),
-        "pixel_values_videos": processed["pixel_values_videos"].to(device),
-        "video_grid_thw": processed["video_grid_thw"].to(device),
-        "labels": labels.to(device),
-        "gt_trajectory": gt_trajectory.to(device),
-        "gt_action": gt_action.to(device),
-        "has_cot": has_cot.to(device),
+    return {
+        "input_ids": batch["input_ids"].to(device),
+        "attention_mask": batch["attention_mask"].to(device),
+        "pixel_values_videos": batch["pixel_values_videos"].to(device),
+        "video_grid_thw": batch["video_grid_thw"].to(device),
+    }, text
+
+
+def _generate_clean_target_tokens(model, prompt_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+    with torch.no_grad():
+        outputs = model.autovla.vlm.generate(
+            **prompt_batch,
+            max_length=model.autovla.gen_conf["max_length"],
+            do_sample=False,
+        )
+    prompt_len = prompt_batch["input_ids"].shape[1]
+    continuation = outputs[:, prompt_len:]
+    eos_id = model.autovla.processor.tokenizer.eos_token_id
+    if continuation.shape[1] > 0 and continuation[0, -1].item() == eos_id:
+        continuation = continuation[:, :-1]
+    if continuation.numel() == 0:
+        raise RuntimeError("Clean surrogate prompt produced no continuation tokens.")
+    return continuation
+
+
+def _build_teacher_forced_batch(
+    prompt_batch: Dict[str, torch.Tensor],
+    continuation_ids: torch.Tensor,
+) -> Dict[str, torch.Tensor]:
+    input_ids = torch.cat([prompt_batch["input_ids"], continuation_ids], dim=1)
+    attention_mask = torch.cat(
+        [
+            prompt_batch["attention_mask"],
+            torch.ones_like(continuation_ids, device=prompt_batch["attention_mask"].device),
+        ],
+        dim=1,
+    )
+    labels = input_ids.clone()
+    labels[:, : prompt_batch["input_ids"].shape[1]] = -100
+    return {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values_videos": prompt_batch["pixel_values_videos"],
+        "video_grid_thw": prompt_batch["video_grid_thw"],
+        "labels": labels,
     }
-    # Keep the original tokenization for loss alignment.
-    batch["input_ids"] = input_ids.to(device)
-    batch["attention_mask"] = attention_mask.to(device)
-    return batch
 
 
 def _action_token_loss(model, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
-    outputs = model.autovla(batch)
+    outputs = model.autovla.vlm(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
+        pixel_values_videos=batch["pixel_values_videos"],
+        video_grid_thw=batch["video_grid_thw"],
+    )
     logits = outputs.logits
     labels = batch["labels"]
     shift_logits = logits[..., :-1, :].contiguous()
@@ -202,34 +340,35 @@ def _action_token_loss(model, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
 def optimize_patch(
     model,
     processor,
-    prompt_text: str,
+    input_features: Mapping,
     clean_videos: Sequence[Sequence[torch.Tensor]],
-    labels: torch.Tensor,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    gt_trajectory: torch.Tensor,
-    gt_action: torch.Tensor,
-    has_cot: torch.Tensor,
     config: WhiteBoxPatchConfig,
     device: str,
+    use_cot: bool,
 ) -> torch.Tensor:
     patch_param = torch.nn.Parameter(torch.zeros(3, 48, 48, device=device))
     optimizer = torch.optim.Adam([patch_param], lr=config.lr)
+    surrogate_clean_videos = _selected_videos(clean_videos, config.cameras, config.frames)
+    clean_messages = _build_surrogate_messages(
+        input_features=input_features,
+        videos=surrogate_clean_videos,
+        cameras=config.cameras,
+        use_cot=use_cot,
+    )
+    clean_prompt_batch, _ = _prepare_surrogate_batch(processor, clean_messages, device)
+    target_ids = _generate_clean_target_tokens(model, clean_prompt_batch)
     for _ in range(config.steps):
         optimizer.zero_grad()
         patched_videos, _ = _apply_patch_to_videos(clean_videos, config, patch_param)
-        batch = _prepare_model_batch(
-            processor=processor,
-            prompt_text=prompt_text,
-            videos=patched_videos,
-            labels=labels,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            gt_trajectory=gt_trajectory,
-            gt_action=gt_action,
-            has_cot=has_cot,
-            device=device,
+        surrogate_patched_videos = _selected_videos(patched_videos, config.cameras, config.frames)
+        patched_messages = _build_surrogate_messages(
+            input_features=input_features,
+            videos=surrogate_patched_videos,
+            cameras=config.cameras,
+            use_cot=use_cot,
         )
+        prompt_batch, _ = _prepare_surrogate_batch(processor, patched_messages, device)
+        batch = _build_teacher_forced_batch(prompt_batch, target_ids)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             action_loss = _action_token_loss(model, batch)
             loss = -config.action_loss_weight * action_loss
@@ -311,33 +450,22 @@ def main() -> None:
         processor,
         using_cot=config["model"].get("use_cot", False),
     )
-    collator = DataCollator(
-        processor=processor,
-        ignore_index=config["model"]["tokens"]["ignore_index"],
-        assistant_id=config["model"]["tokens"]["assistant_id"],
-    )
     with output_jsonl.open("w") as result_file:
         for idx, (scene_path, _) in enumerate(dataset.scenes[: args.num_samples]):
             clean_scene = load_scene(scene_path)
             token = str(clean_scene.get("token", scene_path.stem))
-            sample = dataset[idx]
-            collated = collator([sample])
+            _, input_features, _ = build_features(dataset, scene_path, args.sensor_data_path)
 
             clean_result = predict_scene(model, dataset, scene_path, args.sensor_data_path)
             clean_videos, _ = _scene_videos_from_paths(clean_scene, args.sensor_data_path, args.device)
             patch = optimize_patch(
                 model=model,
                 processor=processor,
-                prompt_text=sample["text"],
+                input_features=input_features,
                 clean_videos=clean_videos,
-                labels=collated["labels"],
-                input_ids=collated["input_ids"],
-                attention_mask=collated["attention_mask"],
-                gt_trajectory=collated["gt_trajectory"],
-                gt_action=collated["gt_action"],
-                has_cot=collated["has_cot"],
                 config=attack_cfg,
                 device=args.device,
+                use_cot=config["model"].get("use_cot", False),
             )
             patched_videos, patched_frames = _apply_patch_to_videos(clean_videos, attack_cfg, patch)
             adv_scene_path, adv_scene = _write_adv_scene_and_images(
