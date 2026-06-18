@@ -77,6 +77,7 @@ for required in "${CONFIG}" "${SCENE_DIR}" "${CHECKPOINT}" "${QWEN_MODEL_PATH}";
 done
 
 RUNTIME_CONFIG="${TMPDIR}/qwen2.5-vl-3B-nusc-sft-autovla-attack.palmetto.yaml"
+export RUNTIME_CONFIG
 python - <<'PY'
 import os
 from pathlib import Path
@@ -89,7 +90,6 @@ cfg["model"]["pretrained_model_path"] = os.environ["QWEN_MODEL_PATH"]
 dst.write_text(yaml.safe_dump(cfg, sort_keys=False))
 print(f"Wrote runtime config: {dst}")
 PY
-export RUNTIME_CONFIG
 
 echo "=== AutoVLA white-box patch attack ==="
 echo "job_id=${SLURM_JOB_ID}"
