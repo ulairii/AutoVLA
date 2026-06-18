@@ -66,14 +66,30 @@ CONFIG="${CONFIG:-${PROJECT_ROOT}/config/eval/qwen2.5-vl-3B-nusc-sft-autovla-att
 SCENE_DIR="${SCENE_DIR:-${AUTOVLA_ROOT}/nuscenes_val}"
 SENSOR_DATA_PATH="${SENSOR_DATA_PATH:-/project/mpese/tigersec/runw/datasets/nuscenes/data_full/nuscenes}"
 CHECKPOINT="${CHECKPOINT:-${AUTOVLA_ROOT}/models/autovla_ckpt/AutoVLA_PDMS_89.ckpt}"
+QWEN_MODEL_PATH="${QWEN_MODEL_PATH:-${AUTOVLA_ROOT}/models/qwen/Qwen2.5-VL-3B-Instruct}"
 export CONFIG SCENE_DIR SENSOR_DATA_PATH CHECKPOINT
 
-for required in "${CONFIG}" "${SCENE_DIR}" "${CHECKPOINT}"; do
+for required in "${CONFIG}" "${SCENE_DIR}" "${CHECKPOINT}" "${QWEN_MODEL_PATH}"; do
   if [[ ! -e "${required}" ]]; then
     echo "Missing required path: ${required}"
     exit 1
   fi
 done
+
+RUNTIME_CONFIG="${TMPDIR}/qwen2.5-vl-3B-nusc-sft-autovla-attack.palmetto.yaml"
+python - <<'PY'
+import os
+from pathlib import Path
+import yaml
+
+src = Path(os.environ["CONFIG"])
+dst = Path(os.environ["RUNTIME_CONFIG"])
+cfg = yaml.safe_load(src.read_text())
+cfg["model"]["pretrained_model_path"] = os.environ["QWEN_MODEL_PATH"]
+dst.write_text(yaml.safe_dump(cfg, sort_keys=False))
+print(f"Wrote runtime config: {dst}")
+PY
+export RUNTIME_CONFIG
 
 echo "=== AutoVLA white-box patch attack ==="
 echo "job_id=${SLURM_JOB_ID}"
@@ -83,6 +99,7 @@ echo "env_prefix=${ENV_PREFIX}"
 echo "work_dir=${AUTOVLA_ROOT}"
 echo "scene_dir=${SCENE_DIR}"
 echo "checkpoint=${CHECKPOINT}"
+echo "qwen_model_path=${QWEN_MODEL_PATH}"
 echo "gpu=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1)"
 
 MONITOR_INTERVAL=120
@@ -110,13 +127,13 @@ from pathlib import Path
 from transformers import AutoProcessor
 import yaml
 
-config = yaml.safe_load(Path(os.environ["CONFIG"]).read_text())
+config = yaml.safe_load(Path(os.environ["RUNTIME_CONFIG"]).read_text())
 AutoProcessor.from_pretrained(config["model"]["pretrained_model_path"], use_fast=True)
 print("HF cache warm check passed.")
 PY
 
 python tools/attack/run_nusc_whitebox_patch_attack.py \
-  --config "${CONFIG}" \
+  --config "${RUNTIME_CONFIG}" \
   --scene_dir "${SCENE_DIR}" \
   --sensor_data_path "${SENSOR_DATA_PATH}" \
   --checkpoint "${CHECKPOINT}" \
