@@ -66,6 +66,7 @@ CONFIG="${CONFIG:-${PROJECT_ROOT}/config/eval/qwen2.5-vl-3B-nusc-sft-autovla-att
 SCENE_DIR="${SCENE_DIR:-${AUTOVLA_ROOT}/nuscenes_val}"
 SENSOR_DATA_PATH="${SENSOR_DATA_PATH:-/project/mpese/tigersec/runw/datasets/nuscenes/data_full/nuscenes}"
 CHECKPOINT="${CHECKPOINT:-${AUTOVLA_ROOT}/models/autovla_ckpt/AutoVLA_PDMS_89.ckpt}"
+export CONFIG SCENE_DIR SENSOR_DATA_PATH CHECKPOINT
 
 for required in "${CONFIG}" "${SCENE_DIR}" "${CHECKPOINT}"; do
   if [[ ! -e "${required}" ]]; then
