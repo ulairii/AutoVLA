@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import random
 import shutil
@@ -69,6 +70,7 @@ class NESPatchConfig:
     final_shift_weight: float = 2.0
     max_shift_weight: float = 0.5
     seed: int = 0
+    restarts: int = 1
 
 
 def load_config(config_path: Path) -> Dict:
@@ -121,6 +123,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final_shift_weight", type=float, default=2.0)
     parser.add_argument("--max_shift_weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--restarts", type=int, default=1)
     parser.add_argument("--output_name", type=str, default="nusc_blackbox_nes_patch_attack")
     return parser.parse_args()
 
@@ -615,10 +618,6 @@ def optimize_patch_nes(
     config: NESPatchConfig,
     device: str,
 ) -> Tuple[torch.Tensor, Dict]:
-    torch.manual_seed(config.seed)
-    np.random.seed(config.seed)
-    random.seed(config.seed)
-
     patch = torch.clamp(torch.randn(3, 64, 64, device=device) * 0.25 + 0.5, 0.0, 1.0)
     total_queries = 0
     best_loss = float("inf")
@@ -747,6 +746,57 @@ def optimize_patch_nes(
     }
 
 
+def _stable_token_seed(token: str, seed: int, restart_idx: int) -> int:
+    digest = hashlib.sha256(f"{token}:{seed}:{restart_idx}".encode("utf-8")).hexdigest()
+    return int(digest[:8], 16)
+
+
+def optimize_patch_restarts(
+    model,
+    dataset: SFTDataset,
+    clean_scene: Mapping,
+    clean_trajectory,
+    sensor_root: str,
+    query_scene_dir: Path,
+    query_image_root: Path,
+    config: NESPatchConfig,
+    device: str,
+) -> Tuple[torch.Tensor, Dict]:
+    token = str(clean_scene.get("token", "sample"))
+    best_patch = None
+    best_info = None
+    restart_histories = []
+    total_queries = 0
+    for restart_idx in range(max(1, config.restarts)):
+        restart_seed = _stable_token_seed(token, config.seed, restart_idx)
+        torch.manual_seed(restart_seed)
+        np.random.seed(restart_seed % (2**32 - 1))
+        random.seed(restart_seed)
+        patch, info = optimize_patch_nes(
+            model=model,
+            dataset=dataset,
+            clean_scene=clean_scene,
+            clean_trajectory=clean_trajectory,
+            sensor_root=sensor_root,
+            query_scene_dir=query_scene_dir / f"restart_{restart_idx:02d}",
+            query_image_root=query_image_root / f"restart_{restart_idx:02d}",
+            config=config,
+            device=device,
+        )
+        total_queries += int(info.get("queries", 0))
+        restart_histories.append({"restart": restart_idx, "seed": restart_seed, **info})
+        if best_info is None or float(info["best_loss"]) < float(best_info["best_loss"]):
+            best_patch = patch
+            best_info = info
+            best_info = {**best_info, "best_restart": restart_idx, "best_restart_seed": restart_seed}
+    assert best_patch is not None and best_info is not None
+    return best_patch, {
+        **best_info,
+        "queries": total_queries,
+        "restarts": restart_histories,
+    }
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -770,10 +820,20 @@ def main() -> None:
         contrastive_weight=args.contrastive_weight,
         target_l2_weight=args.target_l2_weight,
         shift_loss_weight=args.shift_loss_weight,
+        md_forward_min=args.md_forward_min,
+        md_forward_max=args.md_forward_max,
+        md_lateral_min=args.md_lateral_min,
+        md_lateral_max=args.md_lateral_max,
+        md_heading_min=args.md_heading_min,
+        md_heading_max=args.md_heading_max,
+        md_forward_weight=args.md_forward_weight,
+        md_lateral_weight=args.md_lateral_weight,
+        md_heading_weight=args.md_heading_weight,
         mean_shift_weight=args.mean_shift_weight,
         final_shift_weight=args.final_shift_weight,
         max_shift_weight=args.max_shift_weight,
         seed=args.seed,
+        restarts=args.restarts,
     )
 
     run_dir = args.work_dir / args.output_name
@@ -804,7 +864,7 @@ def main() -> None:
 
             sample_query_scene_dir = tmp_root / token / "scenes"
             sample_query_image_root = tmp_root / token / "images"
-            patch, opt_meta = optimize_patch_nes(
+            patch, opt_meta = optimize_patch_restarts(
                 model=model,
                 dataset=clean_dataset,
                 clean_scene=clean_scene,
