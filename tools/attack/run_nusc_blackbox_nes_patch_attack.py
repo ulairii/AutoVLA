@@ -31,7 +31,7 @@ from transformers import AutoProcessor
 
 from dataset_utils.sft_dataset import SFTDataset
 from tools.attack.patch_attack import CAMERA_KEYS, frame_indices, load_scene, resolve_image_path, save_scene
-from tools.attack.run_nusc_patch_attack import build_model, predict_scene
+from tools.attack.run_nusc_patch_attack import build_features, build_model
 from tools.attack.visualization import visualize_attack_sample
 
 
@@ -39,7 +39,7 @@ from tools.attack.visualization import visualize_attack_sample
 class NESPatchConfig:
     patch_ratio: float = 0.18
     position: str = "bottom_center"
-    cameras: Tuple[str, ...] = CAMERA_KEYS
+    cameras: Tuple[str, ...] = ("front_camera_paths",)
     frames: str = "all"
     steps: int = 20
     directions: int = 8
@@ -49,6 +49,9 @@ class NESPatchConfig:
     jitter_px: int = 4
     tv_lambda: float = 0.001
     objective: str = "trajectory_shift"
+    mean_shift_weight: float = 1.0
+    final_shift_weight: float = 2.0
+    max_shift_weight: float = 0.5
     seed: int = 0
 
 
@@ -68,7 +71,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--patch_ratio", type=float, default=0.18)
     parser.add_argument("--position", choices=["bottom_center", "center", "top_center", "bottom_left", "bottom_right"], default="bottom_center")
-    parser.add_argument("--cameras", type=str, default=",".join(CAMERA_KEYS))
+    parser.add_argument("--cameras", type=str, default="front_camera_paths")
     parser.add_argument("--frames", default="all", help="'all', 'first', 'last', or comma-separated frame indices.")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--directions", type=int, default=8)
@@ -77,6 +80,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eot_samples", type=int, default=1)
     parser.add_argument("--jitter_px", type=int, default=4)
     parser.add_argument("--tv_lambda", type=float, default=0.001)
+    parser.add_argument("--mean_shift_weight", type=float, default=1.0)
+    parser.add_argument("--final_shift_weight", type=float, default=2.0)
+    parser.add_argument("--max_shift_weight", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output_name", type=str, default="nusc_blackbox_nes_patch_attack")
     return parser.parse_args()
@@ -204,7 +210,7 @@ def _write_scene_with_patch(
     return scene_path, dict(adv_scene)
 
 
-def _trajectory_shift_loss(clean_trajectory, adv_trajectory) -> float:
+def _trajectory_shift_loss(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> float:
     if clean_trajectory is None or adv_trajectory is None:
         return 0.0
     clean = np.asarray(clean_trajectory, dtype=np.float32)
@@ -215,7 +221,30 @@ def _trajectory_shift_loss(clean_trajectory, adv_trajectory) -> float:
     if n == 0:
         return 0.0
     displacement = np.linalg.norm(clean[:n, :2] - adv[:n, :2], axis=1)
-    return -float(displacement.mean() + displacement[-1])
+    objective = (
+        config.mean_shift_weight * float(displacement.mean())
+        + config.final_shift_weight * float(displacement[-1])
+        + config.max_shift_weight * float(displacement.max())
+    )
+    return -objective
+
+
+def _trajectory_shift_metrics(clean_trajectory, adv_trajectory) -> Dict[str, float]:
+    if clean_trajectory is None or adv_trajectory is None:
+        return {"mean_shift": 0.0, "final_shift": 0.0, "max_shift": 0.0}
+    clean = np.asarray(clean_trajectory, dtype=np.float32)
+    adv = np.asarray(adv_trajectory, dtype=np.float32)
+    if clean.ndim != 2 or adv.ndim != 2 or clean.shape[1] < 2 or adv.shape[1] < 2:
+        return {"mean_shift": 0.0, "final_shift": 0.0, "max_shift": 0.0}
+    n = min(len(clean), len(adv))
+    if n == 0:
+        return {"mean_shift": 0.0, "final_shift": 0.0, "max_shift": 0.0}
+    displacement = np.linalg.norm(clean[:n, :2] - adv[:n, :2], axis=1)
+    return {
+        "mean_shift": float(displacement.mean()),
+        "final_shift": float(displacement[-1]),
+        "max_shift": float(displacement.max()),
+    }
 
 
 def _tv_grad(patch: torch.Tensor) -> torch.Tensor:
@@ -237,6 +266,7 @@ def _query_loss(
     query_scene_dir: Path,
     query_image_root: Path,
     config: NESPatchConfig,
+    jitter: bool,
 ) -> Tuple[float, Dict, Path, Dict]:
     query_scene_path, query_scene = _write_scene_with_patch(
         clean_scene=clean_scene,
@@ -245,11 +275,60 @@ def _query_loss(
         output_scene_dir=query_scene_dir,
         output_image_root=query_image_root,
         config=config,
-        jitter=True,
+        jitter=jitter,
     )
-    result = predict_scene(model, dataset, query_scene_path, str(query_image_root))
-    loss = _trajectory_shift_loss(clean_trajectory, result["trajectory"])
+    result = predict_scene_deterministic(model, dataset, query_scene_path, str(query_image_root))
+    loss = _trajectory_shift_loss(clean_trajectory, result["trajectory"], config)
     return loss, result, query_scene_path, query_scene
+
+
+def predict_scene_deterministic(model, dataset: SFTDataset, scene_path: Path, sensor_data_path: str | None) -> Dict:
+    _, input_features, _ = build_features(dataset, scene_path, sensor_data_path)
+    result = {
+        "trajectory": None,
+        "text": None,
+        "num_action_tokens": 0,
+        "action_tokens": [],
+        "error": None,
+    }
+
+    with torch.no_grad():
+        inputs = model.autovla.get_prompt(input_features)
+        model_inputs = {k: v.to(model.autovla.device) for k, v in inputs.items() if isinstance(v, torch.Tensor)}
+        outputs = model.autovla.vlm.generate(
+            **model_inputs,
+            max_length=model.autovla.gen_conf["max_length"],
+            do_sample=False,
+            temperature=None,
+            top_p=None,
+            top_k=None,
+        )
+
+    outputs_trimmed = [
+        out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, outputs)
+    ][0]
+    if len(outputs_trimmed) and outputs_trimmed[-1].item() == model.autovla.processor.tokenizer.eos_token_id:
+        outputs_trimmed = outputs_trimmed[:-1]
+
+    result["text"] = model.autovla.processor.decode(outputs_trimmed)
+    action_tokens = outputs_trimmed[outputs_trimmed >= model.autovla.action_start_id].cpu()
+    result["num_action_tokens"] = int(len(action_tokens))
+    result["action_tokens"] = [int(token) for token in action_tokens.tolist()]
+
+    if len(action_tokens) == 0:
+        result["error"] = "no_action_tokens"
+        return result
+
+    trajectory = model.autovla.action_tokenizer.decode_token_ids_to_trajectory(action_tokens)
+    if isinstance(trajectory, list):
+        result["error"] = "decode_failed"
+        return result
+
+    trajectory = trajectory[0, 1:]
+    if hasattr(trajectory, "detach"):
+        trajectory = trajectory.detach().cpu().tolist()
+    result["trajectory"] = trajectory
+    return result
 
 
 def optimize_patch_nes(
@@ -273,6 +352,29 @@ def optimize_patch_nes(
     best_patch = patch.detach().clone()
     history = []
     current_lr = config.lr
+    current_loss, current_result, _, _ = _query_loss(
+        model,
+        dataset,
+        clean_scene,
+        clean_trajectory,
+        sensor_root,
+        patch,
+        query_scene_dir,
+        query_image_root,
+        config,
+        jitter=False,
+    )
+    total_queries += 1
+    best_loss = float(current_loss)
+    best_patch = patch.detach().clone()
+    best_metrics = _trajectory_shift_metrics(clean_trajectory, current_result["trajectory"])
+    print(
+        "NES init: "
+        f"loss={best_loss:.4f}, mean_shift={best_metrics['mean_shift']:.3f}, "
+        f"final_shift={best_metrics['final_shift']:.3f}, max_shift={best_metrics['max_shift']:.3f}, "
+        f"queries={total_queries}",
+        flush=True,
+    )
 
     for step in range(1, config.steps + 1):
         grad_est = torch.zeros_like(patch)
@@ -295,6 +397,7 @@ def optimize_patch_nes(
                     query_scene_dir,
                     query_image_root,
                     config,
+                    jitter=True,
                 )
                 lm, _, _, _ = _query_loss(
                     model,
@@ -306,6 +409,7 @@ def optimize_patch_nes(
                     query_scene_dir,
                     query_image_root,
                     config,
+                    jitter=True,
                 )
                 plus_loss += lp
                 minus_loss += lm
@@ -322,21 +426,47 @@ def optimize_patch_nes(
         patch = torch.clamp(patch - current_lr * grad_est, 0.0, 1.0)
 
         avg_loss = step_loss / float(config.directions)
-        history.append(float(avg_loss))
-        if avg_loss < best_loss:
-            best_loss = float(avg_loss)
+        current_loss, current_result, _, _ = _query_loss(
+            model,
+            dataset,
+            clean_scene,
+            clean_trajectory,
+            sensor_root,
+            patch,
+            query_scene_dir,
+            query_image_root,
+            config,
+            jitter=False,
+        )
+        total_queries += 1
+        current_metrics = _trajectory_shift_metrics(clean_trajectory, current_result["trajectory"])
+        history.append(
+            {
+                "step": step,
+                "nes_loss_estimate": float(avg_loss),
+                "evaluated_loss": float(current_loss),
+                **current_metrics,
+                "queries": total_queries,
+            }
+        )
+        if current_loss < best_loss:
+            best_loss = float(current_loss)
             best_patch = patch.detach().clone()
+            best_metrics = current_metrics
         if step in {max(1, int(0.5 * config.steps)), max(1, int(0.8 * config.steps))}:
             current_lr *= 0.5
         print(
-            f"NES step {step}/{config.steps}: loss={avg_loss:.4f}, "
-            f"best={best_loss:.4f}, lr={current_lr:.5f}, queries={total_queries}",
+            f"NES step {step}/{config.steps}: estimate={avg_loss:.4f}, "
+            f"eval={current_loss:.4f}, best={best_loss:.4f}, "
+            f"mean={current_metrics['mean_shift']:.3f}, final={current_metrics['final_shift']:.3f}, "
+            f"max={current_metrics['max_shift']:.3f}, lr={current_lr:.5f}, queries={total_queries}",
             flush=True,
         )
 
     return best_patch.detach(), {
         "history": history,
         "best_loss": best_loss,
+        "best_metrics": best_metrics,
         "queries": total_queries,
     }
 
@@ -356,6 +486,9 @@ def main() -> None:
         eot_samples=args.eot_samples,
         jitter_px=args.jitter_px,
         tv_lambda=args.tv_lambda,
+        mean_shift_weight=args.mean_shift_weight,
+        final_shift_weight=args.final_shift_weight,
+        max_shift_weight=args.max_shift_weight,
         seed=args.seed,
     )
 
@@ -383,7 +516,7 @@ def main() -> None:
             clean_scene = load_scene(scene_path)
             token = str(clean_scene.get("token", scene_path.stem))
             print(f"=== NES black-box sample {sample_idx + 1}/{args.num_samples}: {token} ===", flush=True)
-            clean_result = predict_scene(model, clean_dataset, scene_path, args.sensor_data_path)
+            clean_result = predict_scene_deterministic(model, clean_dataset, scene_path, args.sensor_data_path)
 
             sample_query_scene_dir = tmp_root / token / "scenes"
             sample_query_image_root = tmp_root / token / "images"
@@ -417,8 +550,9 @@ def main() -> None:
                 processor,
                 using_cot=config["model"].get("use_cot", False),
             )
-            adv_result = predict_scene(model, adv_dataset, adv_scene_path, str(adv_image_root))
-            shift_loss = _trajectory_shift_loss(clean_result["trajectory"], adv_result["trajectory"])
+            adv_result = predict_scene_deterministic(model, adv_dataset, adv_scene_path, str(adv_image_root))
+            shift_loss = _trajectory_shift_loss(clean_result["trajectory"], adv_result["trajectory"], attack_cfg)
+            shift_metrics = _trajectory_shift_metrics(clean_result["trajectory"], adv_result["trajectory"])
 
             visualize_attack_sample(
                 clean_scene=clean_scene,
@@ -440,6 +574,7 @@ def main() -> None:
                 "attack": adv_scene["attack"],
                 "optimization": opt_meta,
                 "final_shift_objective_loss": shift_loss,
+                "shift_metrics": shift_metrics,
                 "clean_prediction": clean_result["trajectory"],
                 "adv_prediction": adv_result["trajectory"],
                 "clean_result": clean_result,
