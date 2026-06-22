@@ -49,6 +49,22 @@ class NESPatchConfig:
     jitter_px: int = 4
     tv_lambda: float = 0.001
     objective: str = "trajectory_shift"
+    target_behavior: str = "right_shift"
+    target_lateral_offset: float = 3.5
+    target_speed_scale: float = 0.35
+    contrastive_tau: float = 0.20
+    contrastive_weight: float = 1.0
+    target_l2_weight: float = 0.25
+    shift_loss_weight: float = 0.25
+    md_forward_min: float = 0.0
+    md_forward_max: float = 40.0
+    md_lateral_min: float = -15.0
+    md_lateral_max: float = 15.0
+    md_heading_min: float = -3.141592653589793
+    md_heading_max: float = 3.141592653589793
+    md_forward_weight: float = 1.0
+    md_lateral_weight: float = 2.0
+    md_heading_weight: float = 0.25
     mean_shift_weight: float = 1.0
     final_shift_weight: float = 2.0
     max_shift_weight: float = 0.5
@@ -80,6 +96,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eot_samples", type=int, default=1)
     parser.add_argument("--jitter_px", type=int, default=4)
     parser.add_argument("--tv_lambda", type=float, default=0.001)
+    parser.add_argument(
+        "--objective",
+        choices=["trajectory_shift", "lateral_shift", "max_discrepancy", "contrastive_target", "hybrid_contrastive"],
+        default="trajectory_shift",
+    )
+    parser.add_argument("--target_behavior", choices=["stop", "slowdown", "left_shift", "right_shift"], default="right_shift")
+    parser.add_argument("--target_lateral_offset", type=float, default=3.5)
+    parser.add_argument("--target_speed_scale", type=float, default=0.35)
+    parser.add_argument("--contrastive_tau", type=float, default=0.20)
+    parser.add_argument("--contrastive_weight", type=float, default=1.0)
+    parser.add_argument("--target_l2_weight", type=float, default=0.25)
+    parser.add_argument("--shift_loss_weight", type=float, default=0.25)
+    parser.add_argument("--md_forward_min", type=float, default=0.0)
+    parser.add_argument("--md_forward_max", type=float, default=40.0)
+    parser.add_argument("--md_lateral_min", type=float, default=-15.0)
+    parser.add_argument("--md_lateral_max", type=float, default=15.0)
+    parser.add_argument("--md_heading_min", type=float, default=-3.141592653589793)
+    parser.add_argument("--md_heading_max", type=float, default=3.141592653589793)
+    parser.add_argument("--md_forward_weight", type=float, default=1.0)
+    parser.add_argument("--md_lateral_weight", type=float, default=2.0)
+    parser.add_argument("--md_heading_weight", type=float, default=0.25)
     parser.add_argument("--mean_shift_weight", type=float, default=1.0)
     parser.add_argument("--final_shift_weight", type=float, default=2.0)
     parser.add_argument("--max_shift_weight", type=float, default=0.5)
@@ -203,6 +240,10 @@ def _write_scene_with_patch(
         "eot_samples": config.eot_samples,
         "jitter_px": config.jitter_px,
         "objective": config.objective,
+        "target_behavior": config.target_behavior,
+        "target_lateral_offset": config.target_lateral_offset,
+        "target_speed_scale": config.target_speed_scale,
+        "contrastive_tau": config.contrastive_tau,
         "attacked_images": attacked_images,
     }
     scene_path = output_scene_dir / f"{token}.json"
@@ -229,6 +270,170 @@ def _trajectory_shift_loss(clean_trajectory, adv_trajectory, config: NESPatchCon
     return -objective
 
 
+def _lateral_shift_loss(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> float:
+    if clean_trajectory is None or adv_trajectory is None:
+        return 0.0
+    clean = np.asarray(clean_trajectory, dtype=np.float32)
+    adv = np.asarray(adv_trajectory, dtype=np.float32)
+    if clean.ndim != 2 or adv.ndim != 2 or clean.shape[1] < 2 or adv.shape[1] < 2:
+        return 0.0
+    n = min(len(clean), len(adv))
+    if n == 0:
+        return 0.0
+    internal_left_delta = adv[:n, 1] - clean[:n, 1]
+    if config.target_behavior == "right_shift":
+        signed_lateral = -internal_left_delta
+    elif config.target_behavior == "left_shift":
+        signed_lateral = internal_left_delta
+    else:
+        signed_lateral = np.abs(internal_left_delta)
+    objective = (
+        config.mean_shift_weight * float(signed_lateral.mean())
+        + config.final_shift_weight * float(signed_lateral[-1])
+        + config.max_shift_weight * float(signed_lateral.max())
+    )
+    return -objective
+
+
+def _heading_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return np.arctan2(np.sin(a - b), np.cos(a - b))
+
+
+def _max_discrepancy_loss(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> float:
+    if clean_trajectory is None or adv_trajectory is None:
+        return 0.0
+    clean = np.asarray(clean_trajectory, dtype=np.float32)
+    adv = np.asarray(adv_trajectory, dtype=np.float32)
+    if clean.ndim != 2 or adv.ndim != 2 or clean.shape[1] < 2 or adv.shape[1] < 2:
+        return 0.0
+    n = min(len(clean), len(adv))
+    if n == 0:
+        return 0.0
+    clean = clean[:n]
+    adv = adv[:n]
+
+    f_min, f_max = float(config.md_forward_min), float(config.md_forward_max)
+    l_min, l_max = float(config.md_lateral_min), float(config.md_lateral_max)
+    f_ref = clean[:, 0]
+    l_ref = clean[:, 1]
+    f_target = np.where(np.abs(f_ref - f_min) >= np.abs(f_ref - f_max), f_min, f_max)
+    l_target = np.where(np.abs(l_ref - l_min) >= np.abs(l_ref - l_max), l_min, l_max)
+
+    f_den = np.maximum(np.abs(f_target - f_ref), 1e-3)
+    l_den = np.maximum(np.abs(l_target - l_ref), 1e-3)
+    f_score = ((adv[:, 0] - f_ref) * np.sign(f_target - f_ref)) / f_den
+    l_score = ((adv[:, 1] - l_ref) * np.sign(l_target - l_ref)) / l_den
+    score = (
+        config.md_forward_weight * f_score
+        + config.md_lateral_weight * l_score
+    )
+
+    if clean.shape[1] >= 3 and adv.shape[1] >= 3 and config.md_heading_weight:
+        h_min, h_max = float(config.md_heading_min), float(config.md_heading_max)
+        h_ref = clean[:, 2]
+        h_target = np.where(np.abs(_heading_delta(h_ref, h_min)) >= np.abs(_heading_delta(h_ref, h_max)), h_min, h_max)
+        h_direction = np.sign(_heading_delta(h_target, h_ref))
+        h_score = (_heading_delta(adv[:, 2], h_ref) * h_direction) / np.maximum(np.abs(_heading_delta(h_target, h_ref)), 1e-3)
+        score = score + config.md_heading_weight * h_score
+
+    objective = (
+        config.mean_shift_weight * float(score.mean())
+        + config.final_shift_weight * float(score[-1])
+        + config.max_shift_weight * float(score.max())
+    )
+    return -objective
+
+
+def _valid_trajectory(trajectory) -> bool:
+    arr = np.asarray(trajectory, dtype=np.float32)
+    return arr.ndim == 2 and arr.shape[1] >= 2 and len(arr) > 0
+
+
+def _target_trajectory(clean_trajectory, config: NESPatchConfig):
+    if not _valid_trajectory(clean_trajectory):
+        return None
+    clean = np.asarray(clean_trajectory, dtype=np.float32)
+    target = clean.copy()
+    ramp = np.linspace(0.0, 1.0, len(target), dtype=np.float32)
+
+    if config.target_behavior == "stop":
+        target[:, :2] = 0.0
+    elif config.target_behavior == "slowdown":
+        target[:, :2] *= float(config.target_speed_scale)
+    elif config.target_behavior == "left_shift":
+        target[:, 1] += float(config.target_lateral_offset) * ramp
+    elif config.target_behavior == "right_shift":
+        target[:, 1] -= float(config.target_lateral_offset) * ramp
+    else:
+        raise ValueError(f"Unknown target behavior: {config.target_behavior}")
+    return target
+
+
+def _trajectory_embedding(trajectory) -> np.ndarray:
+    arr = np.asarray(trajectory, dtype=np.float32)
+    xy = arr[:, :2]
+    if len(xy) > 1:
+        delta = np.diff(xy, axis=0, prepend=xy[:1])
+        feat = np.concatenate([xy.reshape(-1), delta.reshape(-1)], axis=0)
+    else:
+        feat = xy.reshape(-1)
+    norm = float(np.linalg.norm(feat))
+    if norm < 1e-6:
+        return feat
+    return feat / norm
+
+
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    denom = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if denom < 1e-6:
+        return 0.0
+    return float(np.dot(a, b) / denom)
+
+
+def _target_distance_loss(target_trajectory, adv_trajectory) -> float:
+    if target_trajectory is None or not _valid_trajectory(adv_trajectory):
+        return 0.0
+    target = np.asarray(target_trajectory, dtype=np.float32)
+    adv = np.asarray(adv_trajectory, dtype=np.float32)
+    n = min(len(target), len(adv))
+    if n == 0:
+        return 0.0
+    displacement = np.linalg.norm(target[:n, :2] - adv[:n, :2], axis=1)
+    return float(displacement.mean() + displacement[-1])
+
+
+def _contrastive_target_loss(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> float:
+    target = _target_trajectory(clean_trajectory, config)
+    if target is None or not _valid_trajectory(adv_trajectory):
+        return 0.0
+    adv_emb = _trajectory_embedding(adv_trajectory)
+    clean_emb = _trajectory_embedding(clean_trajectory)
+    target_emb = _trajectory_embedding(target)
+    tau = max(float(config.contrastive_tau), 1e-6)
+    target_logit = _cosine(adv_emb, target_emb) / tau
+    clean_logit = _cosine(adv_emb, clean_emb) / tau
+    max_logit = max(target_logit, clean_logit)
+    log_denom = max_logit + np.log(np.exp(target_logit - max_logit) + np.exp(clean_logit - max_logit))
+    nce = -target_logit + float(log_denom)
+    return nce + config.target_l2_weight * _target_distance_loss(target, adv_trajectory)
+
+
+def _attack_loss(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> float:
+    shift_loss = _trajectory_shift_loss(clean_trajectory, adv_trajectory, config)
+    if config.objective == "trajectory_shift":
+        return shift_loss
+    if config.objective == "lateral_shift":
+        return _lateral_shift_loss(clean_trajectory, adv_trajectory, config)
+    if config.objective == "max_discrepancy":
+        return _max_discrepancy_loss(clean_trajectory, adv_trajectory, config)
+    contrastive_loss = _contrastive_target_loss(clean_trajectory, adv_trajectory, config)
+    if config.objective == "contrastive_target":
+        return config.contrastive_weight * contrastive_loss
+    if config.objective == "hybrid_contrastive":
+        return config.contrastive_weight * contrastive_loss + config.shift_loss_weight * shift_loss
+    raise ValueError(f"Unknown objective: {config.objective}")
+
+
 def _trajectory_shift_metrics(clean_trajectory, adv_trajectory) -> Dict[str, float]:
     if clean_trajectory is None or adv_trajectory is None:
         return {"mean_shift": 0.0, "final_shift": 0.0, "max_shift": 0.0}
@@ -244,6 +449,74 @@ def _trajectory_shift_metrics(clean_trajectory, adv_trajectory) -> Dict[str, flo
         "mean_shift": float(displacement.mean()),
         "final_shift": float(displacement[-1]),
         "max_shift": float(displacement.max()),
+    }
+
+
+def _target_metrics(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> Dict[str, float]:
+    target = _target_trajectory(clean_trajectory, config)
+    if target is None or not _valid_trajectory(adv_trajectory):
+        return {"target_mean_dist": 0.0, "target_final_dist": 0.0, "target_cosine": 0.0, "clean_cosine": 0.0}
+    adv = np.asarray(adv_trajectory, dtype=np.float32)
+    n = min(len(target), len(adv))
+    if n == 0:
+        return {"target_mean_dist": 0.0, "target_final_dist": 0.0, "target_cosine": 0.0, "clean_cosine": 0.0}
+    displacement = np.linalg.norm(target[:n, :2] - adv[:n, :2], axis=1)
+    adv_emb = _trajectory_embedding(adv[:n])
+    target_emb = _trajectory_embedding(target[:n])
+    clean_emb = _trajectory_embedding(np.asarray(clean_trajectory, dtype=np.float32)[:n])
+    return {
+        "target_mean_dist": float(displacement.mean()),
+        "target_final_dist": float(displacement[-1]),
+        "target_cosine": _cosine(adv_emb, target_emb),
+        "clean_cosine": _cosine(adv_emb, clean_emb),
+    }
+
+
+def _component_shift_metrics(clean_trajectory, adv_trajectory) -> Dict[str, float]:
+    if clean_trajectory is None or adv_trajectory is None:
+        return {
+            "final_forward_delta": 0.0,
+            "final_right_delta": 0.0,
+            "final_abs_lateral_delta": 0.0,
+            "mean_abs_lateral_delta": 0.0,
+            "max_abs_lateral_delta": 0.0,
+        }
+    clean = np.asarray(clean_trajectory, dtype=np.float32)
+    adv = np.asarray(adv_trajectory, dtype=np.float32)
+    if clean.ndim != 2 or adv.ndim != 2 or clean.shape[1] < 2 or adv.shape[1] < 2:
+        return {
+            "final_forward_delta": 0.0,
+            "final_right_delta": 0.0,
+            "final_abs_lateral_delta": 0.0,
+            "mean_abs_lateral_delta": 0.0,
+            "max_abs_lateral_delta": 0.0,
+        }
+    n = min(len(clean), len(adv))
+    if n == 0:
+        return {
+            "final_forward_delta": 0.0,
+            "final_right_delta": 0.0,
+            "final_abs_lateral_delta": 0.0,
+            "mean_abs_lateral_delta": 0.0,
+            "max_abs_lateral_delta": 0.0,
+        }
+    delta = adv[:n, :2] - clean[:n, :2]
+    right_delta = -delta[:, 1]
+    abs_lateral = np.abs(right_delta)
+    return {
+        "final_forward_delta": float(delta[-1, 0]),
+        "final_right_delta": float(right_delta[-1]),
+        "final_abs_lateral_delta": float(abs_lateral[-1]),
+        "mean_abs_lateral_delta": float(abs_lateral.mean()),
+        "max_abs_lateral_delta": float(abs_lateral.max()),
+    }
+
+
+def _all_metrics(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> Dict[str, float]:
+    return {
+        **_trajectory_shift_metrics(clean_trajectory, adv_trajectory),
+        **_target_metrics(clean_trajectory, adv_trajectory, config),
+        **_component_shift_metrics(clean_trajectory, adv_trajectory),
     }
 
 
@@ -278,7 +551,7 @@ def _query_loss(
         jitter=jitter,
     )
     result = predict_scene_deterministic(model, dataset, query_scene_path, str(query_image_root))
-    loss = _trajectory_shift_loss(clean_trajectory, result["trajectory"], config)
+    loss = _attack_loss(clean_trajectory, result["trajectory"], config)
     return loss, result, query_scene_path, query_scene
 
 
@@ -367,11 +640,12 @@ def optimize_patch_nes(
     total_queries += 1
     best_loss = float(current_loss)
     best_patch = patch.detach().clone()
-    best_metrics = _trajectory_shift_metrics(clean_trajectory, current_result["trajectory"])
+    best_metrics = _all_metrics(clean_trajectory, current_result["trajectory"], config)
     print(
         "NES init: "
         f"loss={best_loss:.4f}, mean_shift={best_metrics['mean_shift']:.3f}, "
         f"final_shift={best_metrics['final_shift']:.3f}, max_shift={best_metrics['max_shift']:.3f}, "
+        f"target_final_dist={best_metrics['target_final_dist']:.3f}, "
         f"queries={total_queries}",
         flush=True,
     )
@@ -439,7 +713,7 @@ def optimize_patch_nes(
             jitter=False,
         )
         total_queries += 1
-        current_metrics = _trajectory_shift_metrics(clean_trajectory, current_result["trajectory"])
+        current_metrics = _all_metrics(clean_trajectory, current_result["trajectory"], config)
         history.append(
             {
                 "step": step,
@@ -459,7 +733,9 @@ def optimize_patch_nes(
             f"NES step {step}/{config.steps}: estimate={avg_loss:.4f}, "
             f"eval={current_loss:.4f}, best={best_loss:.4f}, "
             f"mean={current_metrics['mean_shift']:.3f}, final={current_metrics['final_shift']:.3f}, "
-            f"max={current_metrics['max_shift']:.3f}, lr={current_lr:.5f}, queries={total_queries}",
+            f"max={current_metrics['max_shift']:.3f}, "
+            f"target_final_dist={current_metrics['target_final_dist']:.3f}, "
+            f"lr={current_lr:.5f}, queries={total_queries}",
             flush=True,
         )
 
@@ -486,6 +762,14 @@ def main() -> None:
         eot_samples=args.eot_samples,
         jitter_px=args.jitter_px,
         tv_lambda=args.tv_lambda,
+        objective=args.objective,
+        target_behavior=args.target_behavior,
+        target_lateral_offset=args.target_lateral_offset,
+        target_speed_scale=args.target_speed_scale,
+        contrastive_tau=args.contrastive_tau,
+        contrastive_weight=args.contrastive_weight,
+        target_l2_weight=args.target_l2_weight,
+        shift_loss_weight=args.shift_loss_weight,
         mean_shift_weight=args.mean_shift_weight,
         final_shift_weight=args.final_shift_weight,
         max_shift_weight=args.max_shift_weight,
@@ -551,8 +835,8 @@ def main() -> None:
                 using_cot=config["model"].get("use_cot", False),
             )
             adv_result = predict_scene_deterministic(model, adv_dataset, adv_scene_path, str(adv_image_root))
-            shift_loss = _trajectory_shift_loss(clean_result["trajectory"], adv_result["trajectory"], attack_cfg)
-            shift_metrics = _trajectory_shift_metrics(clean_result["trajectory"], adv_result["trajectory"])
+            shift_loss = _attack_loss(clean_result["trajectory"], adv_result["trajectory"], attack_cfg)
+            shift_metrics = _all_metrics(clean_result["trajectory"], adv_result["trajectory"], attack_cfg)
 
             visualize_attack_sample(
                 clean_scene=clean_scene,

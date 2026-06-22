@@ -21,15 +21,24 @@ def _load_image(path: Path) -> Image.Image:
     return Image.open(path).convert("RGB")
 
 
+def _trajectory_plot_xy(trajectory):
+    """Return display coordinates with forward up and right positive."""
+    arr = np.asarray(trajectory, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) == 0:
+        return None
+    right = -arr[:, 1]
+    forward = arr[:, 0]
+    return right, forward
+
+
 def _draw_trajectory(ax, trajectory, label: str, color: str, linestyle: str = "-") -> None:
     if trajectory is None:
         return
-    arr = np.asarray(trajectory, dtype=float)
-    if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) == 0:
+    plot_xy = _trajectory_plot_xy(trajectory)
+    if plot_xy is None:
         return
-    lateral = arr[:, 1]
-    forward = arr[:, 0]
-    ax.plot(lateral, forward, linestyle=linestyle, marker="o", label=label, color=color, linewidth=2)
+    right, forward = plot_xy
+    ax.plot(right, forward, linestyle=linestyle, marker="o", label=label, color=color, linewidth=2)
 
 
 def _set_trajectory_limits(ax, trajectories: Sequence[Sequence[Sequence[float]] | np.ndarray | None]) -> None:
@@ -40,7 +49,7 @@ def _set_trajectory_limits(ax, trajectories: Sequence[Sequence[Sequence[float]] 
         arr = np.asarray(trajectory, dtype=float)
         if arr.ndim != 2 or arr.shape[1] < 2 or len(arr) == 0:
             continue
-        points.append(arr[:, :2])
+        points.append(np.stack([-arr[:, 1], arr[:, 0]], axis=1))
     if not points:
         return
     all_points = np.concatenate(points, axis=0)
@@ -116,9 +125,12 @@ def visualize_attack_sample(
         n = min(len(clean_arr), len(adv_arr))
         if n:
             displacement = np.linalg.norm(clean_arr[:n, :2] - adv_arr[:n, :2], axis=1)
+            final_delta = adv_arr[n - 1, :2] - clean_arr[n - 1, :2]
             diff_text = (
                 f"prediction shift\nmean: {float(displacement.mean()):.3f} m\n"
                 f"final: {float(displacement[-1]):.3f} m\n"
+                f"final forward: {float(final_delta[0]):+.3f} m\n"
+                f"final right: {float(-final_delta[1]):+.3f} m\n"
             ) + "\n".join(
                 f"t{i + 1}: {value:.3f} m" for i, value in enumerate(displacement[:6])
             )
@@ -158,7 +170,7 @@ def visualize_attack_sample(
         _draw_trajectory(traj_ax, clean_scene.get("gt_trajectory"), "gt", "#222222")
         _draw_trajectory(traj_ax, prediction, "pred", color, linestyle)
         _set_fixed_trajectory_limits(traj_ax)
-        traj_ax.set_xlabel("lateral (m)")
+        traj_ax.set_xlabel("right (m)")
         if col == 0:
             traj_ax.set_ylabel("forward (m)")
         traj_ax.legend(loc="best")
