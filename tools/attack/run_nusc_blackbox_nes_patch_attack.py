@@ -1224,7 +1224,7 @@ def main() -> None:
                 adv_sensor_root=str(adv_image_root),
                 clean_prediction=clean_result["trajectory"],
                 adv_prediction=adv_result["trajectory"],
-                title="AutoVLA nuScenes black-box NES patch attack",
+                title=f"AutoVLA nuScenes black-box {sample_attack_cfg.optimizer} patch attack",
             )
             record = {
                 "token": token,
