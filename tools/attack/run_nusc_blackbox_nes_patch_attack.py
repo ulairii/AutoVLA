@@ -15,7 +15,7 @@ import random
 import shutil
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Mapping, MutableMapping, Sequence, Tuple
 
@@ -40,10 +40,16 @@ from tools.attack.visualization import visualize_attack_sample
 class NESPatchConfig:
     patch_ratio: float = 0.18
     position: str = "bottom_center"
+    position_sweep: Tuple[str, ...] = ()
+    position_sweep_trials: int = 3
     cameras: Tuple[str, ...] = ("front_camera_paths",)
     frames: str = "all"
     steps: int = 20
     directions: int = 8
+    optimizer: str = "nes"
+    population: int = 8
+    elite_frac: float = 0.25
+    init_trials: int = 4
     sigma: float = 0.10
     lr: float = 0.08
     eot_samples: int = 1
@@ -53,6 +59,12 @@ class NESPatchConfig:
     target_behavior: str = "right_shift"
     target_lateral_offset: float = 3.5
     target_speed_scale: float = 0.35
+    pa_forward_weight: float = 0.15
+    pa_lateral_weight: float = 2.0
+    pa_target_weight: float = 1.0
+    pa_wrong_way_weight: float = 1.5
+    pa_final_weight: float = 3.0
+    pa_curve_weight: float = 1.0
     contrastive_tau: float = 0.20
     contrastive_weight: float = 1.0
     target_l2_weight: float = 0.25
@@ -88,11 +100,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--patch_ratio", type=float, default=0.18)
-    parser.add_argument("--position", choices=["bottom_center", "center", "top_center", "bottom_left", "bottom_right"], default="bottom_center")
+    parser.add_argument("--position", choices=["bottom_center", "center", "top_center", "bottom_left", "bottom_right", "road_left", "road_right", "horizon_center"], default="bottom_center")
+    parser.add_argument(
+        "--position_sweep",
+        type=str,
+        default="",
+        help="Optional comma-separated candidate patch positions. A short black-box probe picks the best per sample.",
+    )
+    parser.add_argument("--position_sweep_trials", type=int, default=3)
     parser.add_argument("--cameras", type=str, default="front_camera_paths")
     parser.add_argument("--frames", default="all", help="'all', 'first', 'last', or comma-separated frame indices.")
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--directions", type=int, default=8)
+    parser.add_argument("--optimizer", choices=["nes", "evolution"], default="nes")
+    parser.add_argument("--population", type=int, default=8)
+    parser.add_argument("--elite_frac", type=float, default=0.25)
+    parser.add_argument("--init_trials", type=int, default=4)
     parser.add_argument("--sigma", type=float, default=0.10)
     parser.add_argument("--lr", type=float, default=0.08)
     parser.add_argument("--eot_samples", type=int, default=1)
@@ -100,12 +123,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tv_lambda", type=float, default=0.001)
     parser.add_argument(
         "--objective",
-        choices=["trajectory_shift", "lateral_shift", "max_discrepancy", "contrastive_target", "hybrid_contrastive"],
+        choices=["trajectory_shift", "lateral_shift", "max_discrepancy", "position_aware", "contrastive_target", "hybrid_contrastive"],
         default="trajectory_shift",
     )
     parser.add_argument("--target_behavior", choices=["stop", "slowdown", "left_shift", "right_shift"], default="right_shift")
     parser.add_argument("--target_lateral_offset", type=float, default=3.5)
     parser.add_argument("--target_speed_scale", type=float, default=0.35)
+    parser.add_argument("--pa_forward_weight", type=float, default=0.15)
+    parser.add_argument("--pa_lateral_weight", type=float, default=2.0)
+    parser.add_argument("--pa_target_weight", type=float, default=1.0)
+    parser.add_argument("--pa_wrong_way_weight", type=float, default=1.5)
+    parser.add_argument("--pa_final_weight", type=float, default=3.0)
+    parser.add_argument("--pa_curve_weight", type=float, default=1.0)
     parser.add_argument("--contrastive_tau", type=float, default=0.20)
     parser.add_argument("--contrastive_weight", type=float, default=1.0)
     parser.add_argument("--target_l2_weight", type=float, default=0.25)
@@ -148,6 +177,15 @@ def _patch_box(width: int, height: int, ratio: float, position: str, jitter_px: 
     elif position == "bottom_right":
         x0 = width - patch_w - margin
         y0 = height - patch_h - margin
+    elif position == "road_left":
+        x0 = int(width * 0.34 - patch_w * 0.5)
+        y0 = int(height * 0.70 - patch_h * 0.5)
+    elif position == "road_right":
+        x0 = int(width * 0.66 - patch_w * 0.5)
+        y0 = int(height * 0.70 - patch_h * 0.5)
+    elif position == "horizon_center":
+        x0 = (width - patch_w) // 2
+        y0 = int(height * 0.45 - patch_h * 0.5)
     else:
         raise ValueError(f"Unknown patch position: {position}")
 
@@ -234,10 +272,16 @@ def _write_scene_with_patch(
         "name": "blackbox_nes_patch",
         "patch_ratio": config.patch_ratio,
         "position": config.position,
+        "position_sweep": list(config.position_sweep),
+        "position_sweep_trials": config.position_sweep_trials,
         "cameras": list(config.cameras),
         "frames": config.frames,
         "steps": config.steps,
         "directions": config.directions,
+        "optimizer": config.optimizer,
+        "population": config.population,
+        "elite_frac": config.elite_frac,
+        "init_trials": config.init_trials,
         "sigma": config.sigma,
         "lr": config.lr,
         "eot_samples": config.eot_samples,
@@ -246,6 +290,12 @@ def _write_scene_with_patch(
         "target_behavior": config.target_behavior,
         "target_lateral_offset": config.target_lateral_offset,
         "target_speed_scale": config.target_speed_scale,
+        "pa_forward_weight": config.pa_forward_weight,
+        "pa_lateral_weight": config.pa_lateral_weight,
+        "pa_target_weight": config.pa_target_weight,
+        "pa_wrong_way_weight": config.pa_wrong_way_weight,
+        "pa_final_weight": config.pa_final_weight,
+        "pa_curve_weight": config.pa_curve_weight,
         "contrastive_tau": config.contrastive_tau,
         "attacked_images": attacked_images,
     }
@@ -347,6 +397,58 @@ def _max_discrepancy_loss(clean_trajectory, adv_trajectory, config: NESPatchConf
     return -objective
 
 
+def _position_aware_loss(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> float:
+    if clean_trajectory is None or adv_trajectory is None:
+        return 0.0
+    clean = np.asarray(clean_trajectory, dtype=np.float32)
+    adv = np.asarray(adv_trajectory, dtype=np.float32)
+    if clean.ndim != 2 or adv.ndim != 2 or clean.shape[1] < 2 or adv.shape[1] < 2:
+        return 0.0
+    n = min(len(clean), len(adv))
+    if n == 0:
+        return 0.0
+    clean = clean[:n]
+    adv = adv[:n]
+    delta = adv[:, :2] - clean[:, :2]
+
+    if config.target_behavior == "right_shift":
+        signed_lateral = -delta[:, 1]
+    elif config.target_behavior == "left_shift":
+        signed_lateral = delta[:, 1]
+    elif config.target_behavior == "slowdown":
+        signed_lateral = -delta[:, 0]
+    elif config.target_behavior == "stop":
+        signed_lateral = -adv[:, 0]
+    else:
+        signed_lateral = np.abs(delta[:, 1])
+
+    ramp = np.linspace(0.25, 1.0, n, dtype=np.float32)
+    if config.target_behavior in {"left_shift", "right_shift"}:
+        target_profile = float(config.target_lateral_offset) * ramp
+        target_distance = np.abs(np.maximum(target_profile - signed_lateral, 0.0))
+    elif config.target_behavior == "slowdown":
+        target_forward = clean[:, 0] * float(config.target_speed_scale)
+        target_distance = np.maximum(adv[:, 0] - target_forward, 0.0)
+    else:
+        target_distance = np.linalg.norm(adv[:, :2], axis=1)
+
+    wrong_way = np.maximum(-signed_lateral, 0.0)
+    forward_drift = np.abs(delta[:, 0])
+    curvature = np.zeros(n, dtype=np.float32)
+    if n > 2:
+        curvature = np.abs(np.diff(signed_lateral, prepend=signed_lateral[:1]))
+
+    objective = (
+        config.pa_lateral_weight * float((signed_lateral * ramp).mean())
+        + config.pa_final_weight * float(signed_lateral[-1])
+        - config.pa_target_weight * float(target_distance.mean() + target_distance[-1])
+        - config.pa_wrong_way_weight * float(wrong_way.mean() + wrong_way[-1])
+        - config.pa_forward_weight * float(forward_drift.mean())
+        + config.pa_curve_weight * float(np.maximum(curvature, 0.0).mean())
+    )
+    return -objective
+
+
 def _valid_trajectory(trajectory) -> bool:
     arr = np.asarray(trajectory, dtype=np.float32)
     return arr.ndim == 2 and arr.shape[1] >= 2 and len(arr) > 0
@@ -429,6 +531,8 @@ def _attack_loss(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> fl
         return _lateral_shift_loss(clean_trajectory, adv_trajectory, config)
     if config.objective == "max_discrepancy":
         return _max_discrepancy_loss(clean_trajectory, adv_trajectory, config)
+    if config.objective == "position_aware":
+        return _position_aware_loss(clean_trajectory, adv_trajectory, config)
     contrastive_loss = _contrastive_target_loss(clean_trajectory, adv_trajectory, config)
     if config.objective == "contrastive_target":
         return config.contrastive_weight * contrastive_loss
@@ -516,10 +620,83 @@ def _component_shift_metrics(clean_trajectory, adv_trajectory) -> Dict[str, floa
 
 
 def _all_metrics(clean_trajectory, adv_trajectory, config: NESPatchConfig) -> Dict[str, float]:
-    return {
+    metrics = {
         **_trajectory_shift_metrics(clean_trajectory, adv_trajectory),
         **_target_metrics(clean_trajectory, adv_trajectory, config),
         **_component_shift_metrics(clean_trajectory, adv_trajectory),
+    }
+    metrics["position_aware_loss"] = float(_position_aware_loss(clean_trajectory, adv_trajectory, config))
+    return metrics
+
+
+def _sample_probe_patches(config: NESPatchConfig, trials: int, token: str, device: str) -> List[Tuple[int, torch.Tensor]]:
+    patches = []
+    for trial_idx in range(max(1, trials)):
+        probe_seed = _stable_token_seed(token, config.seed + 7919, trial_idx)
+        generator = torch.Generator(device=device)
+        generator.manual_seed(probe_seed)
+        patch = torch.rand((3, 64, 64), generator=generator, device=device)
+        patches.append((probe_seed, patch))
+    return patches
+
+
+def select_patch_position(
+    model,
+    dataset: SFTDataset,
+    clean_scene: Mapping,
+    clean_trajectory,
+    sensor_root: str,
+    query_scene_dir: Path,
+    query_image_root: Path,
+    config: NESPatchConfig,
+    device: str,
+) -> Tuple[NESPatchConfig, Dict]:
+    if not config.position_sweep:
+        return config, {"selected_position": config.position, "position_sweep": []}
+
+    token = str(clean_scene.get("token", "sample"))
+    candidates = []
+    total_queries = 0
+    for position in config.position_sweep:
+        pos_config = replace(config, position=position, jitter_px=0)
+        losses = []
+        metrics = []
+        for trial_idx, (probe_seed, patch) in enumerate(_sample_probe_patches(config, config.position_sweep_trials, token, device)):
+            loss, result, _, _ = _query_loss(
+                model=model,
+                dataset=dataset,
+                clean_scene=clean_scene,
+                clean_trajectory=clean_trajectory,
+                sensor_root=sensor_root,
+                patch=patch,
+                query_scene_dir=query_scene_dir / "position_sweep" / position / f"trial_{trial_idx:02d}",
+                query_image_root=query_image_root / "position_sweep" / position / f"trial_{trial_idx:02d}",
+                config=pos_config,
+                jitter=False,
+            )
+            total_queries += 1
+            losses.append(float(loss))
+            metrics.append({"seed": probe_seed, **_all_metrics(clean_trajectory, result["trajectory"], pos_config)})
+        candidates.append(
+            {
+                "position": position,
+                "mean_loss": float(np.mean(losses)),
+                "best_loss": float(np.min(losses)),
+                "metrics": metrics,
+            }
+        )
+
+    selected = min(candidates, key=lambda item: item["mean_loss"])
+    print(
+        "Position sweep: "
+        + ", ".join(f"{item['position']}={item['mean_loss']:.4f}" for item in candidates)
+        + f" -> {selected['position']}",
+        flush=True,
+    )
+    return replace(config, position=str(selected["position"])), {
+        "selected_position": str(selected["position"]),
+        "position_sweep": candidates,
+        "position_sweep_queries": total_queries,
     }
 
 
@@ -746,6 +923,123 @@ def optimize_patch_nes(
     }
 
 
+def optimize_patch_evolution(
+    model,
+    dataset: SFTDataset,
+    clean_scene: Mapping,
+    clean_trajectory,
+    sensor_root: str,
+    query_scene_dir: Path,
+    query_image_root: Path,
+    config: NESPatchConfig,
+    device: str,
+) -> Tuple[torch.Tensor, Dict]:
+    total_queries = 0
+    best_loss = float("inf")
+    best_patch = None
+    best_metrics = {}
+    history = []
+    population = max(2, int(config.population))
+    elite_count = max(1, min(population, int(round(population * float(config.elite_frac)))))
+
+    init_records = []
+    for trial_idx in range(max(1, int(config.init_trials))):
+        patch = torch.clamp(torch.randn(3, 64, 64, device=device) * 0.25 + 0.5, 0.0, 1.0)
+        loss, result, _, _ = _query_loss(
+            model,
+            dataset,
+            clean_scene,
+            clean_trajectory,
+            sensor_root,
+            patch,
+            query_scene_dir / "init" / f"trial_{trial_idx:02d}",
+            query_image_root / "init" / f"trial_{trial_idx:02d}",
+            config,
+            jitter=False,
+        )
+        total_queries += 1
+        metrics = _all_metrics(clean_trajectory, result["trajectory"], config)
+        init_records.append((float(loss), patch.detach().clone(), metrics))
+        if float(loss) < best_loss:
+            best_loss = float(loss)
+            best_patch = patch.detach().clone()
+            best_metrics = metrics
+
+    assert best_patch is not None
+    center = best_patch.detach().clone()
+    current_sigma = float(config.sigma)
+    print(
+        "Evolution init: "
+        f"loss={best_loss:.4f}, mean_shift={best_metrics['mean_shift']:.3f}, "
+        f"final_shift={best_metrics['final_shift']:.3f}, max_shift={best_metrics['max_shift']:.3f}, "
+        f"target_final_dist={best_metrics['target_final_dist']:.3f}, "
+        f"queries={total_queries}",
+        flush=True,
+    )
+
+    for step in range(1, config.steps + 1):
+        candidates = [(best_loss, best_patch.detach().clone(), best_metrics)]
+        for cand_idx in range(population):
+            noise = torch.randn_like(center)
+            patch = torch.clamp(center + current_sigma * noise, 0.0, 1.0)
+            loss, result, _, _ = _query_loss(
+                model,
+                dataset,
+                clean_scene,
+                clean_trajectory,
+                sensor_root,
+                patch,
+                query_scene_dir / f"evolution_step_{step:03d}" / f"candidate_{cand_idx:02d}",
+                query_image_root / f"evolution_step_{step:03d}" / f"candidate_{cand_idx:02d}",
+                config,
+                jitter=False,
+            )
+            total_queries += 1
+            metrics = _all_metrics(clean_trajectory, result["trajectory"], config)
+            candidates.append((float(loss), patch.detach().clone(), metrics))
+
+        candidates.sort(key=lambda item: item[0])
+        elites = candidates[:elite_count]
+        elite_patches = torch.stack([item[1] for item in elites], dim=0)
+        center = torch.clamp(
+            (1.0 - float(config.lr)) * center + float(config.lr) * elite_patches.mean(dim=0),
+            0.0,
+            1.0,
+        )
+        if candidates[0][0] < best_loss:
+            best_loss, best_patch, best_metrics = candidates[0]
+        if step in {max(1, int(0.5 * config.steps)), max(1, int(0.8 * config.steps))}:
+            current_sigma *= 0.6
+
+        history.append(
+            {
+                "step": step,
+                "best_loss": float(best_loss),
+                "step_best_loss": float(candidates[0][0]),
+                "step_median_loss": float(np.median([item[0] for item in candidates])),
+                **best_metrics,
+                "sigma": current_sigma,
+                "queries": total_queries,
+            }
+        )
+        print(
+            f"Evolution step {step}/{config.steps}: "
+            f"step_best={candidates[0][0]:.4f}, best={best_loss:.4f}, "
+            f"mean={best_metrics['mean_shift']:.3f}, final={best_metrics['final_shift']:.3f}, "
+            f"right={best_metrics['final_right_delta']:.3f}, sigma={current_sigma:.4f}, "
+            f"queries={total_queries}",
+            flush=True,
+        )
+
+    return best_patch.detach(), {
+        "history": history,
+        "best_loss": best_loss,
+        "best_metrics": best_metrics,
+        "queries": total_queries,
+        "optimizer": "evolution",
+    }
+
+
 def _stable_token_seed(token: str, seed: int, restart_idx: int) -> int:
     digest = hashlib.sha256(f"{token}:{seed}:{restart_idx}".encode("utf-8")).hexdigest()
     return int(digest[:8], 16)
@@ -772,7 +1066,8 @@ def optimize_patch_restarts(
         torch.manual_seed(restart_seed)
         np.random.seed(restart_seed % (2**32 - 1))
         random.seed(restart_seed)
-        patch, info = optimize_patch_nes(
+        optimizer = optimize_patch_evolution if config.optimizer == "evolution" else optimize_patch_nes
+        patch, info = optimizer(
             model=model,
             dataset=dataset,
             clean_scene=clean_scene,
@@ -803,10 +1098,16 @@ def main() -> None:
     attack_cfg = NESPatchConfig(
         patch_ratio=args.patch_ratio,
         position=args.position,
+        position_sweep=tuple(part.strip() for part in args.position_sweep.split(",") if part.strip()),
+        position_sweep_trials=args.position_sweep_trials,
         cameras=tuple(part.strip() for part in args.cameras.split(",") if part.strip()),
         frames=args.frames,
         steps=args.steps,
         directions=args.directions,
+        optimizer=args.optimizer,
+        population=args.population,
+        elite_frac=args.elite_frac,
+        init_trials=args.init_trials,
         sigma=args.sigma,
         lr=args.lr,
         eot_samples=args.eot_samples,
@@ -816,6 +1117,12 @@ def main() -> None:
         target_behavior=args.target_behavior,
         target_lateral_offset=args.target_lateral_offset,
         target_speed_scale=args.target_speed_scale,
+        pa_forward_weight=args.pa_forward_weight,
+        pa_lateral_weight=args.pa_lateral_weight,
+        pa_target_weight=args.pa_target_weight,
+        pa_wrong_way_weight=args.pa_wrong_way_weight,
+        pa_final_weight=args.pa_final_weight,
+        pa_curve_weight=args.pa_curve_weight,
         contrastive_tau=args.contrastive_tau,
         contrastive_weight=args.contrastive_weight,
         target_l2_weight=args.target_l2_weight,
@@ -864,7 +1171,7 @@ def main() -> None:
 
             sample_query_scene_dir = tmp_root / token / "scenes"
             sample_query_image_root = tmp_root / token / "images"
-            patch, opt_meta = optimize_patch_restarts(
+            sample_attack_cfg, position_meta = select_patch_position(
                 model=model,
                 dataset=clean_dataset,
                 clean_scene=clean_scene,
@@ -873,6 +1180,17 @@ def main() -> None:
                 query_scene_dir=sample_query_scene_dir,
                 query_image_root=sample_query_image_root,
                 config=attack_cfg,
+                device=args.device,
+            )
+            patch, opt_meta = optimize_patch_restarts(
+                model=model,
+                dataset=clean_dataset,
+                clean_scene=clean_scene,
+                clean_trajectory=clean_result["trajectory"],
+                sensor_root=args.sensor_data_path,
+                query_scene_dir=sample_query_scene_dir,
+                query_image_root=sample_query_image_root,
+                config=sample_attack_cfg,
                 device=args.device,
             )
             patch_path = patch_dir / f"{token}.pt"
@@ -885,7 +1203,7 @@ def main() -> None:
                 patch=patch,
                 output_scene_dir=adv_scene_dir,
                 output_image_root=adv_image_root,
-                config=attack_cfg,
+                config=sample_attack_cfg,
                 jitter=False,
             )
             adv_dataset = SFTDataset(
@@ -895,8 +1213,8 @@ def main() -> None:
                 using_cot=config["model"].get("use_cot", False),
             )
             adv_result = predict_scene_deterministic(model, adv_dataset, adv_scene_path, str(adv_image_root))
-            shift_loss = _attack_loss(clean_result["trajectory"], adv_result["trajectory"], attack_cfg)
-            shift_metrics = _all_metrics(clean_result["trajectory"], adv_result["trajectory"], attack_cfg)
+            shift_loss = _attack_loss(clean_result["trajectory"], adv_result["trajectory"], sample_attack_cfg)
+            shift_metrics = _all_metrics(clean_result["trajectory"], adv_result["trajectory"], sample_attack_cfg)
 
             visualize_attack_sample(
                 clean_scene=clean_scene,
@@ -916,7 +1234,7 @@ def main() -> None:
                 "patch_png": str(patch_dir / f"{token}.png"),
                 "visualization": str(vis_dir / f"{token}.png"),
                 "attack": adv_scene["attack"],
-                "optimization": opt_meta,
+                "optimization": {**opt_meta, **position_meta},
                 "final_shift_objective_loss": shift_loss,
                 "shift_metrics": shift_metrics,
                 "clean_prediction": clean_result["trajectory"],
