@@ -40,6 +40,8 @@ from tools.attack.visualization import visualize_attack_sample
 class NESPatchConfig:
     patch_ratio: float = 0.18
     position: str = "bottom_center"
+    position_xy: Tuple[float, float] | None = None
+    scene_aware_position: bool = False
     position_sweep: Tuple[str, ...] = ()
     position_sweep_trials: int = 3
     cameras: Tuple[str, ...] = ("front_camera_paths",)
@@ -100,7 +102,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--num_samples", type=int, default=10)
     parser.add_argument("--patch_ratio", type=float, default=0.18)
-    parser.add_argument("--position", choices=["bottom_center", "center", "top_center", "bottom_left", "bottom_right", "road_left", "road_right", "horizon_center"], default="bottom_center")
+    parser.add_argument("--position", choices=["bottom_center", "center", "top_center", "bottom_left", "bottom_right", "road_left", "road_right", "horizon_center", "scene_aware"], default="bottom_center")
     parser.add_argument(
         "--position_sweep",
         type=str,
@@ -197,6 +199,72 @@ def _patch_box(width: int, height: int, ratio: float, position: str, jitter_px: 
     return x0, y0, x0 + patch_w, y0 + patch_h
 
 
+def _patch_box_from_center(width: int, height: int, ratio: float, center_xy: Tuple[float, float], jitter_px: int = 0) -> Tuple[int, int, int, int]:
+    patch_w = max(1, int(width * ratio))
+    patch_h = max(1, int(height * ratio))
+    cx = int(float(center_xy[0]) * width)
+    cy = int(float(center_xy[1]) * height)
+    if jitter_px > 0:
+        cx += random.randint(-jitter_px, jitter_px)
+        cy += random.randint(-jitter_px, jitter_px)
+    x0 = max(0, min(width - patch_w, cx - patch_w // 2))
+    y0 = max(0, min(height - patch_h, cy - patch_h // 2))
+    return x0, y0, x0 + patch_w, y0 + patch_h
+
+
+def _scene_aware_patch_center(image: Image.Image, ratio: float) -> Tuple[float, float, Dict[str, float | str]]:
+    arr = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+    height, width = arr.shape[:2]
+    patch_w = max(1, int(width * ratio))
+    patch_h = max(1, int(height * ratio))
+    hsv = np.asarray(image.convert("HSV"), dtype=np.float32)
+    hue = hsv[:, :, 0]
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+
+    road_y0 = int(height * 0.40)
+    road_y1 = int(height * 0.88)
+    x_min = int(width * 0.12)
+    x_max = int(width * 0.88)
+    roi = np.s_[road_y0:road_y1, x_min:x_max]
+
+    orange = (((hue >= 8) & (hue <= 32)) | ((hue >= 245) & (hue <= 255))) & (sat > 70) & (val > 65)
+    orange_roi = orange[roi]
+    if int(orange_roi.sum()) > max(30, int(0.0008 * width * height)):
+        ys, xs = np.nonzero(orange_roi)
+        cx = float(np.median(xs + x_min) / width)
+        cy = float(np.median(ys + road_y0) / height)
+        return cx, cy, {"scene_aware_reason": "orange_construction", "orange_pixels": float(orange_roi.sum())}
+
+    gray = arr.mean(axis=2)
+    gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+    gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+    edge = gx + gy
+    roi_edge = edge[roi].copy()
+    yy, xx = np.indices(roi_edge.shape)
+    center_bias = 1.0 - np.minimum(np.abs((xx + x_min) / max(width - 1, 1) - 0.5) / 0.38, 1.0)
+    forward_bias = np.clip((yy + road_y0) / max(height - 1, 1), 0.0, 1.0)
+    score = roi_edge * (0.35 + 0.65 * center_bias) * (0.35 + 0.65 * forward_bias)
+
+    if score.size:
+        kernel_h = max(4, patch_h // 2)
+        kernel_w = max(4, patch_w // 2)
+        stride = max(4, min(kernel_h, kernel_w) // 4)
+        best_score = -1.0
+        best_x = width * 0.5
+        best_y = height * 0.58
+        for y in range(0, max(1, score.shape[0] - kernel_h + 1), stride):
+            for x in range(0, max(1, score.shape[1] - kernel_w + 1), stride):
+                val_score = float(score[y:y + kernel_h, x:x + kernel_w].mean())
+                if val_score > best_score:
+                    best_score = val_score
+                    best_x = x_min + x + kernel_w * 0.5
+                    best_y = road_y0 + y + kernel_h * 0.5
+        return float(best_x / width), float(best_y / height), {"scene_aware_reason": "road_edge_texture", "texture_score": best_score}
+
+    return 0.5, 0.55, {"scene_aware_reason": "fallback_horizon"}
+
+
 def _pil_to_unit_tensor(image: Image.Image) -> torch.Tensor:
     arr = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
     return torch.from_numpy(arr).permute(2, 0, 1)
@@ -210,13 +278,22 @@ def _unit_tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 def _apply_patch_to_image(image: Image.Image, patch: torch.Tensor, config: NESPatchConfig, jitter: bool) -> Image.Image:
     base = _pil_to_unit_tensor(image)
     _, height, width = base.shape
-    x0, y0, x1, y1 = _patch_box(
-        width,
-        height,
-        config.patch_ratio,
-        config.position,
-        config.jitter_px if jitter else 0,
-    )
+    if config.position_xy is not None:
+        x0, y0, x1, y1 = _patch_box_from_center(
+            width,
+            height,
+            config.patch_ratio,
+            config.position_xy,
+            config.jitter_px if jitter else 0,
+        )
+    else:
+        x0, y0, x1, y1 = _patch_box(
+            width,
+            height,
+            config.patch_ratio,
+            config.position,
+            config.jitter_px if jitter else 0,
+        )
     resized_patch = F.interpolate(
         patch.detach().cpu().unsqueeze(0),
         size=(y1 - y0, x1 - x0),
@@ -272,6 +349,8 @@ def _write_scene_with_patch(
         "name": "blackbox_nes_patch",
         "patch_ratio": config.patch_ratio,
         "position": config.position,
+        "position_xy": list(config.position_xy) if config.position_xy is not None else None,
+        "scene_aware_position": config.scene_aware_position,
         "position_sweep": list(config.position_sweep),
         "position_sweep_trials": config.position_sweep_trials,
         "cameras": list(config.cameras),
@@ -656,9 +735,14 @@ def select_patch_position(
 
     token = str(clean_scene.get("token", "sample"))
     candidates = []
+    candidate_configs = {}
     total_queries = 0
     for position in config.position_sweep:
         pos_config = replace(config, position=position, jitter_px=0)
+        pos_meta = {}
+        if position == "scene_aware":
+            pos_config, pos_meta = configure_scene_aware_position(clean_scene, sensor_root, pos_config)
+        candidate_configs[position] = pos_config
         losses = []
         metrics = []
         for trial_idx, (probe_seed, patch) in enumerate(_sample_probe_patches(config, config.position_sweep_trials, token, device)):
@@ -680,6 +764,7 @@ def select_patch_position(
         candidates.append(
             {
                 "position": position,
+                **pos_meta,
                 "mean_loss": float(np.mean(losses)),
                 "best_loss": float(np.min(losses)),
                 "metrics": metrics,
@@ -693,10 +778,38 @@ def select_patch_position(
         + f" -> {selected['position']}",
         flush=True,
     )
-    return replace(config, position=str(selected["position"])), {
+    selected_config = candidate_configs.get(str(selected["position"]), replace(config, position=str(selected["position"])))
+    return selected_config, {
         "selected_position": str(selected["position"]),
         "position_sweep": candidates,
         "position_sweep_queries": total_queries,
+    }
+
+
+def configure_scene_aware_position(clean_scene: Mapping, sensor_root: str, config: NESPatchConfig) -> Tuple[NESPatchConfig, Dict]:
+    if config.position != "scene_aware":
+        return config, {}
+    front_paths = list(clean_scene.get("front_camera_paths") or [])
+    if not front_paths:
+        return replace(config, position="horizon_center", scene_aware_position=True), {
+            "scene_aware_reason": "missing_front",
+            "scene_aware_position_xy": None,
+        }
+    selected = frame_indices(len(front_paths), config.frames)
+    frame_idx = selected[-1] if selected else min(3, len(front_paths) - 1)
+    image_path = resolve_image_path(front_paths[frame_idx], sensor_root)
+    with Image.open(image_path) as image:
+        cx, cy, meta = _scene_aware_patch_center(image, config.patch_ratio)
+    tuned = replace(config, position="scene_aware", position_xy=(cx, cy), scene_aware_position=True)
+    print(
+        f"Scene-aware position: xy=({cx:.3f},{cy:.3f}), reason={meta.get('scene_aware_reason')}, frame={frame_idx}",
+        flush=True,
+    )
+    return tuned, {
+        **meta,
+        "scene_aware_position_xy": [float(cx), float(cy)],
+        "scene_aware_frame": int(frame_idx),
+        "scene_aware_image": str(image_path),
     }
 
 
@@ -1171,6 +1284,11 @@ def main() -> None:
 
             sample_query_scene_dir = tmp_root / token / "scenes"
             sample_query_image_root = tmp_root / token / "images"
+            base_sample_attack_cfg, scene_meta = configure_scene_aware_position(
+                clean_scene=clean_scene,
+                sensor_root=args.sensor_data_path,
+                config=attack_cfg,
+            )
             sample_attack_cfg, position_meta = select_patch_position(
                 model=model,
                 dataset=clean_dataset,
@@ -1179,7 +1297,7 @@ def main() -> None:
                 sensor_root=args.sensor_data_path,
                 query_scene_dir=sample_query_scene_dir,
                 query_image_root=sample_query_image_root,
-                config=attack_cfg,
+                config=base_sample_attack_cfg,
                 device=args.device,
             )
             patch, opt_meta = optimize_patch_restarts(
@@ -1234,7 +1352,7 @@ def main() -> None:
                 "patch_png": str(patch_dir / f"{token}.png"),
                 "visualization": str(vis_dir / f"{token}.png"),
                 "attack": adv_scene["attack"],
-                "optimization": {**opt_meta, **position_meta},
+                "optimization": {**opt_meta, **scene_meta, **position_meta},
                 "final_shift_objective_loss": shift_loss,
                 "shift_metrics": shift_metrics,
                 "clean_prediction": clean_result["trajectory"],
